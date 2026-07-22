@@ -298,10 +298,10 @@ func (t *topic) close() {
 // expiry checks cost O(1) to peek instead of scanning every lease.
 type deadlineHeap []*inflight
 
-func (h deadlineHeap) Len() int            { return len(h) }
-func (h deadlineHeap) Less(i, j int) bool  { return h[i].deadline.Before(h[j].deadline) }
-func (h deadlineHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
-func (h *deadlineHeap) Push(x any)         { fl := x.(*inflight); fl.index = len(*h); *h = append(*h, fl) }
+func (h deadlineHeap) Len() int           { return len(h) }
+func (h deadlineHeap) Less(i, j int) bool { return h[i].deadline.Before(h[j].deadline) }
+func (h deadlineHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
+func (h *deadlineHeap) Push(x any)        { fl := x.(*inflight); fl.index = len(*h); *h = append(*h, fl) }
 func (h *deadlineHeap) Pop() any {
 	old := *h
 	n := len(old)
