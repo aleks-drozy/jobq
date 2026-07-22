@@ -29,9 +29,18 @@ type topic struct {
 // request is one operation for the actor loop. Exactly one field is set.
 type request struct {
 	enqueue *enqueueReq
+	adopt   *adoptReq
 	dequeue *dequeueReq
 	settle  *settleReq
 	stats   chan Stats
+}
+
+// adoptReq hands an existing job to this topic without resetting its
+// history. Used for dead-lettering, where the attempt count and the original
+// enqueue time are the evidence of what went wrong.
+type adoptReq struct {
+	job   *Job
+	reply chan struct{}
 }
 
 type enqueueReq struct {
@@ -155,6 +164,20 @@ func (t *topic) run() {
 				stats.Enqueued++
 				r.reply <- enqueueResp{id: job.ID}
 
+			case req.adopt != nil:
+				job := req.adopt.job
+				job.Topic = t.name
+				// The job gets a fresh attempt budget here so a consumer can
+				// drain the dead-letter topic; the failure evidence moves to
+				// DeadLetteredAttempts, which nothing resets.
+				job.DeadLetteredAttempts = job.Attempts
+				job.Attempts = 0
+				job.Attempt = 0
+				job.MaxAttempts = DefaultMaxAttempts
+				ready = append(ready, job)
+				stats.Enqueued++
+				close(req.adopt.reply)
+
 			case req.dequeue != nil:
 				r := req.dequeue
 				expire()
@@ -242,6 +265,15 @@ func (t *topic) enqueue(payload []byte, opts EnqueueOptions) (string, error) {
 	}
 	resp := <-reply
 	return resp.id, resp.err
+}
+
+// adopt places an existing job into this topic, preserving its history.
+func (t *topic) adopt(job *Job) {
+	reply := make(chan struct{})
+	if err := t.send(request{adopt: &adoptReq{job: job, reply: reply}}); err != nil {
+		return
+	}
+	<-reply
 }
 
 func (t *topic) dequeue(visibility time.Duration) (*Job, Lease, error) {

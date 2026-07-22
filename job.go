@@ -44,6 +44,11 @@ type Job struct {
 	NotBefore time.Time
 	// DeadLetteredAt is set only on jobs read from a dead-letter topic.
 	DeadLetteredAt time.Time
+	// DeadLetteredAttempts records how many attempts the job consumed on its
+	// original topic before being dead-lettered. Attempts is reset when the
+	// job enters the dead-letter topic (so it gets a fresh budget there),
+	// which would otherwise destroy the evidence of why it failed.
+	DeadLetteredAttempts int
 }
 
 // Lease is a consumer's temporary, exclusive claim on a job.
