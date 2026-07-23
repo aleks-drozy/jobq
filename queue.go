@@ -21,11 +21,15 @@ func DeadLetterTopic(topic string) string { return topic + DeadLetterSuffix }
 // state lives in per-topic actor goroutines, so contention here is limited
 // to topic creation.
 type Queue struct {
-	now func() time.Time
+	now  func() time.Time
+	wal  *wal // nil in in-memory mode
+	wopt walOptions
 
-	mu     sync.RWMutex
-	topics map[string]*topic
-	closed bool
+	mu          sync.RWMutex
+	topics      map[string]*topic
+	topicIDs    map[string]uint32
+	nextTopicID uint32
+	closed      bool
 }
 
 // Option configures a Queue.
@@ -37,13 +41,80 @@ func WithClock(now func() time.Time) Option {
 	return func(q *Queue) { q.now = now }
 }
 
-// New creates an empty Queue.
+// WithSync selects the fsync policy for a durable queue (see SyncPolicy for
+// what each one risks). Ignored by New.
+func WithSync(p SyncPolicy) Option {
+	return func(q *Queue) { q.wopt.policy = p }
+}
+
+// WithSyncEvery sets the flush period for SyncInterval. Ignored otherwise.
+func WithSyncEvery(d time.Duration) Option {
+	return func(q *Queue) { q.wopt.interval = d }
+}
+
+// WithSegmentSize caps WAL segment files, mainly for tests. Ignored by New.
+func WithSegmentSize(n int64) Option {
+	return func(q *Queue) { q.wopt.segmentBytes = n }
+}
+
+// New creates an empty, purely in-memory Queue. Nothing survives Close.
 func New(opts ...Option) *Queue {
-	q := &Queue{now: time.Now, topics: map[string]*topic{}}
+	q := &Queue{now: time.Now, topics: map[string]*topic{}, topicIDs: map[string]uint32{}}
 	for _, opt := range opts {
 		opt(q)
 	}
 	return q
+}
+
+// Open creates or recovers a durable Queue rooted at dir. The returned
+// report says exactly what recovery found and did; log it.
+func Open(dir string, opts ...Option) (*Queue, RecoveryReport, error) {
+	q := New(opts...)
+	if err := ensureWALDir(dir); err != nil {
+		return nil, RecoveryReport{}, err
+	}
+	lock, err := acquireDirLock(dir)
+	if err != nil {
+		return nil, RecoveryReport{}, err
+	}
+	st, rep, err := replayDir(walSubdir(dir))
+	if err != nil {
+		_ = releaseDirLock(lock)
+		return nil, rep, err
+	}
+	w, err := openWALWithLock(dir, q.wopt, lock)
+	if err != nil {
+		_ = releaseDirLock(lock)
+		return nil, rep, err
+	}
+	q.wal = w
+
+	ids, maxID := topicIDsFromLog(st.topics)
+	q.topicIDs = ids
+	q.nextTopicID = maxID
+
+	// Seed restored topics deterministically (sorted names) so replay order
+	// never depends on map iteration.
+	names := make([]string, 0, len(st.topicJobs))
+	for name := range st.topicJobs {
+		names = append(names, name)
+	}
+	sortStrings(names)
+	for _, name := range names {
+		if _, err := q.makeTopic(name, st.topicJobs[name]); err != nil {
+			_ = q.Close()
+			return nil, rep, err
+		}
+	}
+	return q, rep, nil
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
 }
 
 // EnqueueOption tunes a single Enqueue call.
@@ -166,6 +237,9 @@ func (q *Queue) Close() error {
 	for _, tp := range q.topics {
 		tp.close()
 	}
+	if q.wal != nil {
+		return q.wal.close()
+	}
 	return nil
 }
 
@@ -208,7 +282,47 @@ func (q *Queue) topicFor(name string, create bool) (*topic, error) {
 	if tp, ok := q.topics[name]; ok { // lost the race; reuse the winner
 		return tp, nil
 	}
-	tp = newTopic(name, q.now, q.deadLetterHandler(name))
+	return q.makeTopicLocked(name, nil)
+}
+
+// makeTopic creates a topic (with restored jobs) taking the registry lock.
+func (q *Queue) makeTopic(name string, initial []*Job) (*topic, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return nil, ErrClosed
+	}
+	if tp, ok := q.topics[name]; ok {
+		return tp, nil
+	}
+	return q.makeTopicLocked(name, initial)
+}
+
+// makeTopicLocked assigns the topic's WAL identity (logging a TOPIC record
+// on first assignment) and starts its actor. Caller holds q.mu.
+func (q *Queue) makeTopicLocked(name string, initial []*Job) (*topic, error) {
+	var logRec func(walRecord, bool) waiter
+	var id uint32
+	if q.wal != nil {
+		known, ok := q.topicIDs[name]
+		if !ok {
+			q.nextTopicID++
+			known = q.nextTopicID
+			q.topicIDs[name] = known
+			w := q.wal.append(walRecord{Type: recTopic, TopicID: known, TopicName: name}, false)
+			_ = w // TOPIC records ride the next group commit
+		}
+		id = known
+		logRec = q.wal.append
+	}
+	tp := newTopic(topicConfig{
+		name:       name,
+		now:        q.now,
+		deadLetter: q.deadLetterHandler(name),
+		logRec:     logRec,
+		walID:      id,
+		initial:    initial,
+	})
 	q.topics[name] = tp
 	return tp, nil
 }
@@ -225,10 +339,25 @@ func (q *Queue) deadLetterHandler(name string) func(*Job) bool {
 	return func(job *Job) bool {
 		// Runs on the source topic's actor goroutine. The DLQ is a separate
 		// actor, so this hands off without blocking on shared state.
+		// Attempts are captured BEFORE adopt: once the job is in the DLQ's
+		// ready list a consumer may already be mutating its counters.
+		attemptsAtDeath := job.Attempts
+		deadAt := job.DeadLetteredAt
+		jobID := job.ID
 		dlq, err := q.topicFor(dlqName, true)
 		if err != nil {
 			return false // queue closing; counted as Dropped by the caller
 		}
-		return dlq.adopt(job)
+		if !dlq.adopt(job) {
+			return false
+		}
+		if q.wal != nil {
+			q.mu.RLock()
+			dlqID := q.topicIDs[dlqName]
+			q.mu.RUnlock()
+			q.wal.append(walRecord{Type: recAdopt, JobID: jobID, TopicID: dlqID,
+				Attempts: attemptsAtDeath, At: deadAt}, false)
+		}
+		return true
 	}
 }

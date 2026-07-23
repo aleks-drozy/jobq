@@ -64,23 +64,37 @@ type wal struct {
 	committerDone chan struct{}
 }
 
+func walSubdir(dir string) string { return filepath.Join(dir, "wal") }
+
+func ensureWALDir(dir string) error { return os.MkdirAll(walSubdir(dir), 0o755) }
+
 func openWAL(dir string, opts walOptions) (*wal, error) {
-	if opts.interval <= 0 {
-		opts.interval = defaultSyncInterval
-	}
-	if opts.segmentBytes <= 0 {
-		opts.segmentBytes = defaultSegmentBytes
-	}
-	if err := os.MkdirAll(filepath.Join(dir, "wal"), 0o755); err != nil {
+	if err := ensureWALDir(dir); err != nil {
 		return nil, err
 	}
 	lock, err := acquireDirLock(dir)
 	if err != nil {
 		return nil, err
 	}
-	seg, err := openSegmentWriter(filepath.Join(dir, "wal"), opts.segmentBytes)
+	w, err := openWALWithLock(dir, opts, lock)
 	if err != nil {
 		_ = releaseDirLock(lock)
+		return nil, err
+	}
+	return w, nil
+}
+
+// openWALWithLock builds the WAL for a directory whose lock the caller
+// already holds (Open replays before the writer starts; both need the lock).
+func openWALWithLock(dir string, opts walOptions, lock *os.File) (*wal, error) {
+	if opts.interval <= 0 {
+		opts.interval = defaultSyncInterval
+	}
+	if opts.segmentBytes <= 0 {
+		opts.segmentBytes = defaultSegmentBytes
+	}
+	seg, err := openSegmentWriter(walSubdir(dir), opts.segmentBytes)
+	if err != nil {
 		return nil, err
 	}
 	w := &wal{
