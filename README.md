@@ -7,13 +7,17 @@ per-job attempt budgets, delayed jobs, and dead-letter queues — built to be
 explained, not just to run. The design decisions, the failure modes, and the
 costs of each are documented rather than assumed.
 
-**Status: P1 complete — core engine.** In-memory, fully tested. P2 adds the
-write-ahead log and crash recovery, P3 an HTTP surface, P4 benchmarks and
-the design deep-dive.
+**Status: P2 complete — durable.** A segmented, CRC-checked write-ahead log
+with group commit, deterministic replay, and a crash harness that kills the
+process cold and proves nothing acknowledged is lost. P3 adds an HTTP
+surface, P4 the full design deep-dive.
 
 ```go
-q := jobq.New()
+q, report, _ := jobq.Open("./data", jobq.WithSync(jobq.SyncAlways))
 defer q.Close()
+log.Printf("recovered: %+v", report) // replay says exactly what it found
+
+// or purely in-memory: q := jobq.New()
 
 q.Enqueue("emails", []byte(`{"to":"a@b.ie"}`), jobq.WithMaxAttempts(3))
 
@@ -53,7 +57,50 @@ overwritten by normal use is not evidence.
 
 **Time is injectable.** Every time-dependent behaviour reads a clock
 function, so tests drive lease expiry deterministically instead of sleeping.
-The test suite runs in under a second.
+
+## Durability
+
+The contract reduces to two rules: an enqueue is durable before `Enqueue`
+returns (under `SyncAlways`), and an acked job never comes back. Everything
+else can be lost and re-derived at the cost of a duplicate, which
+at-least-once permits.
+
+**Restarts expire every lease.** Leases are not persisted: a job in flight
+at crash time returns to ready with its attempt count intact — or
+dead-letters, if the crash consumed its last attempt. Recovery introduces no
+semantics a consumer hasn't already seen from an ordinary timeout, and the
+inference is deterministic, so it is never re-logged.
+
+**The log is one queue-wide segmented WAL, group-committed.** Actors hand
+encoded records to a single committer goroutine; while one batch is inside
+`fsync`, everything arriving accumulates into the next. Frames are
+CRC-checked with the checksum covering the length prefix; segment headers
+are synced at creation because Windows cannot fsync a directory, so file
+contents — never file names — are the source of truth. A torn tail is
+truncated, counted, and reported; corruption before the tail refuses to
+guess.
+
+**The crash harness proves it.** A child process enqueues and consumes under
+`SyncAlways`, reporting every acknowledged operation; the parent kills it
+cold (`Process.Kill`, no flush) at a random moment and recovers the
+directory. Across the standard five rounds: hundreds of acknowledged
+enqueues per round, zero lost, zero acked jobs resurrected, duplicates
+counted and permitted.
+
+### What each sync policy costs
+
+256-byte payloads, Ryzen 7 5700U, NVMe SSD, Windows 11, Go 1.26. One
+machine's numbers, honestly labelled; run `go test -bench BenchmarkEnqueue`
+on yours.
+
+| Policy | Sequential | 16 concurrent producers | A crash loses |
+|---|---|---|---|
+| `SyncAlways` | 550 µs/op (~1.8k/s) | **65 µs/op (~15k/s)** | nothing acknowledged |
+| `SyncInterval` (5 ms) | 6.2 µs/op | 5.0 µs/op | ≤ 5 ms of acked enqueues |
+| `SyncNever` | 5.6 µs/op | 4.7 µs/op | an unbounded suffix |
+
+The parallel column is group commit doing its job: sixteen producers share
+each fsync instead of paying for sixteen.
 
 ## Tests
 
