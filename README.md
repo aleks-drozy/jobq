@@ -115,8 +115,15 @@ Beyond per-behaviour table tests, two properties are checked directly:
   entered the queue is accounted for in exactly one place — ready, in flight,
   acked, or dead-lettered. Leaks and double-counts are silent in ordinary
   use; this is what catches them.
-- **No double delivery.** Consumers racing against expiring leases never hold
-  the same job simultaneously, verified under the race detector.
+- **Unique settlement, honest overlap.** The queue never hands a job to a
+  second consumer without an intervening lease expiry or nack — but once a
+  lease expires, at-least-once means the previous holder may still be
+  working while the redelivery is in someone else's hands. That overlap is
+  the contract, not a bug (`Job.ID` and `Job.Attempts` exist so consumers
+  can be idempotent), and what IS guaranteed is pinned under the race
+  detector: for each job, exactly one lease's Ack ever succeeds — every
+  superseded lease is rejected at settle time. The test asserts it actually
+  witnessed an overlap, so it cannot silently stop testing the scenario.
 
 ## Not in v1
 
