@@ -83,6 +83,37 @@ func crashChildMain(dir string) {
 	}
 }
 
+// durablyAckedIDs walks the WAL segments the same way replayDir does and
+// returns every job ID with a durable recAck. Torn tails are tolerated: a
+// partially-written trailing record simply ends the scan, exactly as
+// recovery treats it.
+func durablyAckedIDs(t *testing.T, walDir string) map[string]bool {
+	t.Helper()
+	segs, err := listSegments(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acked := map[string]bool{}
+	for _, seg := range segs {
+		raw, err := os.ReadFile(seg.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf := raw[segmentHeaderSize:]
+		for len(buf) > 0 {
+			rec, n, err := readRecord(buf)
+			if err != nil {
+				break // torn tail: nothing after it is durable
+			}
+			if rec.Type == recAck {
+				acked[rec.JobID] = true
+			}
+			buf = buf[n:]
+		}
+	}
+	return acked
+}
+
 func TestCrashRecoveryLosesNothingAcknowledged(t *testing.T) {
 	if testing.Short() {
 		t.Skip("crash harness skipped under -short")
@@ -165,15 +196,29 @@ func TestCrashRecoveryLosesNothingAcknowledged(t *testing.T) {
 					}
 				}
 			}
-			lost := 0
+			// The child prints ACK only after Ack returns, and Ack returns
+			// only after its record is fsynced (rule 2) - so a kill can land
+			// BETWEEN the durable ack and the print. Such a job is neither
+			// restored nor reported, but it is not lost: its ack is on disk.
+			// Read the WAL directly and accept a durable recAck as proof of
+			// settlement. (The mirror race is impossible in this direction:
+			// a printed ACK implies a durable record, which is what makes
+			// the GHOST check above sound.)
+			durableAcks := durablyAckedIDs(t, walSubdir(dir))
+			lost, unprinted := 0, 0
 			for id, payload := range enqueued {
 				if !acked[id] && recovered[id] == 0 {
+					if durableAcks[id] {
+						unprinted++ // durably settled; only the report was cut off
+						continue
+					}
 					lost++
 					t.Errorf("LOST: acknowledged enqueue %s (%s) is gone", id, payload)
 				}
 			}
 			if lost == 0 {
-				t.Logf("contract held: 0 lost, %d recovered, duplicates permitted", len(recovered))
+				t.Logf("contract held: 0 lost, %d recovered, %d acked-but-unreported, duplicates permitted",
+					len(recovered), unprinted)
 			}
 		})
 	}

@@ -283,8 +283,19 @@ func (t *topic) run() {
 					heap.Remove(deadline, fl.index)
 					stats.InFlight--
 					stats.Acked++
-					t.log(walRecord{Type: recAck, JobID: fl.job.ID}, false)
-					r.reply <- settleResp{}
+					// Rule 2 of the durability contract: an acked job never
+					// comes back. Only true if the ack record is durable
+					// before Ack returns success (under SyncAlways) - an
+					// ungated ack rides the next group commit, and a crash
+					// in that window replays the durable enqueue without
+					// the lost ack, resurrecting the job. The crash harness
+					// caught exactly that as a flaky GHOST. Same off-loop
+					// forwarding as Rule 1: fsync stalls the caller, never
+					// the actor.
+					wait := t.log(walRecord{Type: recAck, JobID: fl.job.ID}, true)
+					go func(reply chan settleResp) {
+						reply <- settleResp{err: <-wait}
+					}(r.reply)
 				case settleNack:
 					delete(leases, r.leaseID)
 					heap.Remove(deadline, fl.index)
