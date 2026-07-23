@@ -139,25 +139,41 @@ func TestConservationInvariantUnderRandomOperations(t *testing.T) {
 	}
 }
 
-// A job must never be delivered to two consumers at once, even when leases
-// are expiring while other consumers are dequeuing. This is the property the
-// actor model exists to guarantee; run it under -race.
-func TestNoConcurrentDoubleDeliveryUnderExpiry(t *testing.T) {
+// What a visibility-timeout queue actually guarantees under expiry - and the
+// predecessor of this test pinned the wrong thing. "Consumers never hold the
+// same job simultaneously" is FALSE by construction for at-least-once: when a
+// lease expires, the previous holder may still be working while the
+// redelivered job is in a new consumer's hands. That overlap is the contract
+// (Job.ID and Job.Attempts exist so consumers can be idempotent), not a bug.
+// The real invariants, both pinned here under -race:
+//
+//  1. Settlement is unique: for each job, exactly one lease's Ack ever
+//     succeeds; an expired or superseded lease's Ack must be rejected.
+//  2. The overlap is real and observable: this harness ASSERTS it witnessed
+//     at least one overlap, so it can never silently go vacuous the way its
+//     predecessor did (which released its holder flag before settling and
+//     used a ready list too deep for redelivery to land inside the window).
+func TestExpiryOverlapIsPermittedButSettlementIsUnique(t *testing.T) {
 	clk := newTestClock()
 	q := New(WithClock(clk.Now))
 	defer func() { _ = q.Close() }()
 
-	const jobs = 150
+	const jobs = 3 // small on purpose: redelivery must land inside the window
+	enqueued := map[string]bool{}
 	for i := 0; i < jobs; i++ {
-		if _, err := q.Enqueue("work", []byte("x"), WithMaxAttempts(100)); err != nil {
+		id, err := q.Enqueue("work", []byte("x"), WithMaxAttempts(1000))
+		if err != nil {
 			t.Fatal(err)
 		}
+		enqueued[id] = true
 	}
 
 	var (
-		mu      sync.Mutex
-		holders = map[string]bool{} // jobID -> currently leased by someone
-		wg      sync.WaitGroup
+		mu       sync.Mutex
+		live     = map[string]int{} // jobID -> holders that have NOT settled yet
+		overlaps int
+		acked    = map[string]int{} // jobID -> successful acks
+		wg       sync.WaitGroup
 	)
 	stop := make(chan struct{})
 
@@ -176,35 +192,48 @@ func TestNoConcurrentDoubleDeliveryUnderExpiry(t *testing.T) {
 					continue
 				}
 				mu.Lock()
-				if holders[job.ID] {
-					mu.Unlock()
-					t.Errorf("job %s leased twice simultaneously", job.ID)
-					return
+				live[job.ID]++
+				if live[job.ID] > 1 {
+					overlaps++ // permitted - counted, not condemned
 				}
-				holders[job.ID] = true
 				mu.Unlock()
 
-				// Hold briefly, then release by ack or by letting it expire.
-				if job.Attempt%2 == 0 {
-					mu.Lock()
-					delete(holders, job.ID)
-					mu.Unlock()
-					_ = q.Ack(lease)
-				} else {
-					mu.Lock()
-					delete(holders, job.ID)
-					mu.Unlock()
-					_ = q.Nack(lease)
+				// Odd attempts hold long enough for the advancing clock to
+				// expire the lease and for the redelivery to be dequeued
+				// WHILE this holder is still unsettled - that is the overlap
+				// being pinned. Even attempts settle fast, so every job
+				// eventually acks inside a valid lease. The holder count
+				// drops only AFTER Ack returns, so the guarded window
+				// genuinely spans the settle call.
+				if job.Attempts%2 == 1 {
+					time.Sleep(10 * time.Millisecond)
 				}
+				ackErr := q.Ack(lease)
+				mu.Lock()
+				if ackErr == nil {
+					acked[job.ID]++
+				}
+				live[job.ID]--
+				mu.Unlock()
 			}
 		}()
 	}
 
-	// Drive expiry concurrently with the consumers.
 	for i := 0; i < 200; i++ {
 		clk.Advance(300 * time.Millisecond)
 		time.Sleep(time.Millisecond)
 	}
 	close(stop)
 	wg.Wait()
+
+	if overlaps == 0 {
+		t.Fatal("harness never witnessed an expiry overlap - the scenario " +
+			"this test exists for did not occur, so its assertions prove nothing")
+	}
+	for id := range enqueued {
+		if acked[id] != 1 {
+			t.Errorf("job %s settled %d times; settlement must be unique "+
+				"(every non-winning lease's Ack must be rejected)", id, acked[id])
+		}
+	}
 }
