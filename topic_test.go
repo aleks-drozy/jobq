@@ -38,10 +38,11 @@ func newTestTopic(t *testing.T) (*topic, *testClock, *[]*Job) {
 	clk := newTestClock()
 	var mu sync.Mutex
 	dead := &[]*Job{}
-	tp := newTopic("jobs", clk.Now, func(j *Job) {
+	tp := newTopic("jobs", clk.Now, func(j *Job) bool {
 		mu.Lock()
 		*dead = append(*dead, j)
 		mu.Unlock()
+		return true
 	})
 	t.Cleanup(tp.close)
 	return tp, clk, dead
@@ -161,7 +162,7 @@ func TestExtendPushesDeadlineOut(t *testing.T) {
 	mustEnqueue(t, tp, "long", EnqueueOptions{})
 	_, lease := mustDequeue(t, tp, 10*time.Second)
 
-	if err := tp.extend(lease.ID, time.Minute); err != nil {
+	if _, err := tp.extend(lease.ID, time.Minute); err != nil {
 		t.Fatalf("extend: %v", err)
 	}
 	clk.Advance(30 * time.Second) // past the ORIGINAL deadline only

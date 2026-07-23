@@ -24,6 +24,12 @@ var (
 	ErrClosed = errors.New("jobq: closed")
 	// ErrEmptyTopic means a topic name was empty.
 	ErrEmptyTopic = errors.New("jobq: topic name must not be empty")
+	// ErrReservedTopic means the topic name is reserved for dead-letter
+	// queues; jobs arrive there only by exhausting their attempts.
+	ErrReservedTopic = errors.New("jobq: topic names ending in .dlq are reserved")
+	// ErrNonPositiveDuration means a visibility timeout or extension was
+	// zero or negative, which would issue an already-expired lease.
+	ErrNonPositiveDuration = errors.New("jobq: duration must be positive")
 )
 
 // DefaultMaxAttempts is used when EnqueueOptions.MaxAttempts is zero.
@@ -84,6 +90,11 @@ type Stats struct {
 	Ready       int // visible now or waiting on a delay
 	InFlight    int // leased, not yet settled
 	Acked       int // cumulative
-	DeadLetters int // cumulative moves to the DLQ
-	Enqueued    int // cumulative
+	DeadLetters int // cumulative jobs that ARRIVED in this topic's DLQ
+	// Dropped counts jobs destroyed because they exhausted their attempts on
+	// a topic that has no onward dead-letter queue (i.e. inside a DLQ, where
+	// ".dlq.dlq" chains are refused). Destruction is permitted there, but
+	// never silent: this counter is the record.
+	Dropped  int
+	Enqueued int // cumulative
 }

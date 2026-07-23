@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"crypto/rand"
 	"encoding/hex"
+	"sync"
 	"time"
 )
 
@@ -19,11 +20,13 @@ type topic struct {
 	name string
 	now  func() time.Time
 	// deadLetter is called from the actor goroutine when a job exhausts its
-	// attempts. The Queue routes it into the "<name>.dlq" topic.
-	deadLetter func(*Job)
+	// attempts; it reports whether the job actually arrived in the DLQ.
+	// nil on dead-letter topics themselves (no ".dlq.dlq" chains).
+	deadLetter func(*Job) bool
 
-	reqs chan request
-	done chan struct{}
+	reqs      chan request
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // request is one operation for the actor loop. Exactly one field is set.
@@ -77,7 +80,12 @@ type settleReq struct {
 	kind    settleKind
 	leaseID string
 	extend  time.Duration
-	reply   chan error
+	reply   chan settleResp
+}
+
+type settleResp struct {
+	deadline time.Time // effective lease deadline after an extend
+	err      error
 }
 
 // inflight is a leased job awaiting settlement.
@@ -88,7 +96,7 @@ type inflight struct {
 	index    int // position in the deadline heap, maintained by heap.Interface
 }
 
-func newTopic(name string, now func() time.Time, deadLetter func(*Job)) *topic {
+func newTopic(name string, now func() time.Time, deadLetter func(*Job) bool) *topic {
 	t := &topic{
 		name:       name,
 		now:        now,
@@ -151,9 +159,11 @@ func (t *topic) run() {
 				r := req.enqueue
 				now := t.now()
 				job := &Job{
-					ID:          newID(),
-					Topic:       t.name,
-					Payload:     r.payload,
+					ID:    newID(),
+					Topic: t.name,
+					// Copied: a producer reusing its buffer after Enqueue
+					// must not be able to mutate what gets delivered.
+					Payload:     append([]byte(nil), r.payload...),
 					MaxAttempts: r.opts.MaxAttempts,
 					EnqueuedAt:  now,
 				}
@@ -180,6 +190,10 @@ func (t *topic) run() {
 
 			case req.dequeue != nil:
 				r := req.dequeue
+				if r.visibility <= 0 {
+					r.reply <- dequeueResp{err: ErrNonPositiveDuration}
+					break
+				}
 				expire()
 				job := popReady()
 				if job == nil {
@@ -197,6 +211,7 @@ func (t *topic) run() {
 				heap.Push(deadline, fl)
 				stats.InFlight++
 				copied := *job
+				copied.Payload = append([]byte(nil), job.Payload...)
 				r.reply <- dequeueResp{
 					job: &copied,
 					lease: Lease{
@@ -212,7 +227,7 @@ func (t *topic) run() {
 				expire() // a lease that just expired must not settle
 				fl, ok := leases[r.leaseID]
 				if !ok {
-					r.reply <- ErrUnknownLease
+					r.reply <- settleResp{err: ErrUnknownLease}
 					break
 				}
 				switch r.kind {
@@ -221,17 +236,22 @@ func (t *topic) run() {
 					heap.Remove(deadline, fl.index)
 					stats.InFlight--
 					stats.Acked++
-					r.reply <- nil
+					r.reply <- settleResp{}
 				case settleNack:
 					delete(leases, r.leaseID)
 					heap.Remove(deadline, fl.index)
 					stats.InFlight--
 					t.retire(fl.job, &ready, &stats)
-					r.reply <- nil
+					r.reply <- settleResp{}
 				case settleExtend:
-					fl.deadline = t.now().Add(r.extend)
-					heap.Fix(deadline, fl.index)
-					r.reply <- nil
+					// Extend only lengthens. Shortening a live lease would
+					// hand the job to a second consumer while the first
+					// still holds it; releasing early is what Nack is for.
+					if proposed := t.now().Add(r.extend); proposed.After(fl.deadline) {
+						fl.deadline = proposed
+						heap.Fix(deadline, fl.index)
+					}
+					r.reply <- settleResp{deadline: fl.deadline}
 				}
 
 			case req.stats != nil:
@@ -244,14 +264,18 @@ func (t *topic) run() {
 	}
 }
 
-// retire sends a job back to the ready list, or to the dead-letter queue if
-// it has no attempts left. Called only from the actor goroutine.
+// retire sends a job back to the ready list, or onward when it has no
+// attempts left: into the dead-letter queue, or — inside a DLQ, which has no
+// onward queue — out of existence, counted in Stats.Dropped so destruction
+// is never silent. DeadLetters counts confirmed arrivals, not intentions.
+// Called only from the actor goroutine.
 func (t *topic) retire(job *Job, ready *[]*Job, stats *Stats) {
 	if job.Attempts >= job.MaxAttempts {
 		job.DeadLetteredAt = t.now()
-		stats.DeadLetters++
-		if t.deadLetter != nil {
-			t.deadLetter(job)
+		if t.deadLetter != nil && t.deadLetter(job) {
+			stats.DeadLetters++
+		} else {
+			stats.Dropped++
 		}
 		return
 	}
@@ -267,13 +291,15 @@ func (t *topic) enqueue(payload []byte, opts EnqueueOptions) (string, error) {
 	return resp.id, resp.err
 }
 
-// adopt places an existing job into this topic, preserving its history.
-func (t *topic) adopt(job *Job) {
+// adopt places an existing job into this topic, preserving its history, and
+// reports whether the topic accepted it before shutdown.
+func (t *topic) adopt(job *Job) bool {
 	reply := make(chan struct{})
 	if err := t.send(request{adopt: &adoptReq{job: job, reply: reply}}); err != nil {
-		return
+		return false
 	}
 	<-reply
+	return true
 }
 
 func (t *topic) dequeue(visibility time.Duration) (*Job, Lease, error) {
@@ -285,19 +311,30 @@ func (t *topic) dequeue(visibility time.Duration) (*Job, Lease, error) {
 	return resp.job, resp.lease, resp.err
 }
 
-func (t *topic) ack(leaseID string) error  { return t.settle(settleAck, leaseID, 0) }
-func (t *topic) nack(leaseID string) error { return t.settle(settleNack, leaseID, 0) }
+func (t *topic) ack(leaseID string) error {
+	_, err := t.settle(settleAck, leaseID, 0)
+	return err
+}
 
-func (t *topic) extend(leaseID string, d time.Duration) error {
+func (t *topic) nack(leaseID string) error {
+	_, err := t.settle(settleNack, leaseID, 0)
+	return err
+}
+
+func (t *topic) extend(leaseID string, d time.Duration) (time.Time, error) {
+	if d <= 0 {
+		return time.Time{}, ErrNonPositiveDuration
+	}
 	return t.settle(settleExtend, leaseID, d)
 }
 
-func (t *topic) settle(kind settleKind, leaseID string, d time.Duration) error {
-	reply := make(chan error, 1)
+func (t *topic) settle(kind settleKind, leaseID string, d time.Duration) (time.Time, error) {
+	reply := make(chan settleResp, 1)
 	if err := t.send(request{settle: &settleReq{kind: kind, leaseID: leaseID, extend: d, reply: reply}}); err != nil {
-		return err
+		return time.Time{}, err
 	}
-	return <-reply
+	resp := <-reply
+	return resp.deadline, resp.err
 }
 
 func (t *topic) stats() Stats {
@@ -319,11 +356,7 @@ func (t *topic) send(req request) error {
 }
 
 func (t *topic) close() {
-	select {
-	case <-t.done: // already closed
-	default:
-		close(t.done)
-	}
+	t.closeOnce.Do(func() { close(t.done) })
 }
 
 // deadlineHeap is a min-heap of in-flight jobs ordered by lease deadline, so

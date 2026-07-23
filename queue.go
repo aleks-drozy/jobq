@@ -65,6 +65,13 @@ func (q *Queue) Enqueue(topicName string, payload []byte, opts ...EnqueueOption)
 	if strings.TrimSpace(topicName) == "" {
 		return "", ErrEmptyTopic
 	}
+	// Dead-letter topics are populated only by exhausted jobs. Allowing
+	// direct enqueue would let a user topic named "x.dlq" collide with the
+	// auto-created DLQ of "x" — and jobs exhausting their attempts on such a
+	// topic would have nowhere to go.
+	if strings.HasSuffix(topicName, DeadLetterSuffix) {
+		return "", ErrReservedTopic
+	}
 	var o EnqueueOptions
 	for _, opt := range opts {
 		opt(&o)
@@ -109,12 +116,16 @@ func (q *Queue) Nack(lease Lease) error {
 	return tp.nack(lease.ID)
 }
 
-// Extend pushes a lease's deadline out by d from now, for consumers that
-// need longer than the visibility timeout they asked for.
-func (q *Queue) Extend(lease Lease, d time.Duration) error {
+// Extend lengthens a lease to at least d from now and returns the effective
+// deadline. It never shortens a lease (releasing early is Nack's job) and
+// rejects non-positive durations, which would amount to instant revocation.
+func (q *Queue) Extend(lease Lease, d time.Duration) (time.Time, error) {
+	if d <= 0 {
+		return time.Time{}, ErrNonPositiveDuration
+	}
 	tp, err := q.leaseTopic(lease)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	return tp.extend(lease.ID, d)
 }
@@ -140,23 +151,19 @@ func (q *Queue) Topics() []string {
 	return names
 }
 
-// Close shuts down every topic. It is idempotent, and in-flight jobs are
-// simply dropped: durability across restarts is the WAL's job (P2), not
-// Close's.
+// Close shuts down every topic. It is idempotent and safe to call
+// concurrently; the topic shutdown loop runs under the registry lock, so a
+// second Close returns only after the first has finished. Jobs still in
+// memory are dropped: durability across restarts is the WAL's job (P2), not
+// Close's. An operation racing Close may complete or return ErrClosed.
 func (q *Queue) Close() error {
 	q.mu.Lock()
+	defer q.mu.Unlock()
 	if q.closed {
-		q.mu.Unlock()
 		return nil
 	}
 	q.closed = true
-	topics := make([]*topic, 0, len(q.topics))
 	for _, tp := range q.topics {
-		topics = append(topics, tp)
-	}
-	q.mu.Unlock()
-
-	for _, tp := range topics {
 		tp.close()
 	}
 	return nil
@@ -210,18 +217,18 @@ func (q *Queue) topicFor(name string, create bool) (*topic, error) {
 // a dead-letter topic are not re-dead-lettered: that would build an infinite
 // chain of ".dlq.dlq" topics, so they are dropped after their attempts run
 // out and the DeadLetters counter is the record that it happened.
-func (q *Queue) deadLetterHandler(name string) func(*Job) {
+func (q *Queue) deadLetterHandler(name string) func(*Job) bool {
 	if strings.HasSuffix(name, DeadLetterSuffix) {
 		return nil
 	}
 	dlqName := DeadLetterTopic(name)
-	return func(job *Job) {
+	return func(job *Job) bool {
 		// Runs on the source topic's actor goroutine. The DLQ is a separate
 		// actor, so this hands off without blocking on shared state.
 		dlq, err := q.topicFor(dlqName, true)
 		if err != nil {
-			return // queue closing; the job dies with the process (see P2)
+			return false // queue closing; counted as Dropped by the caller
 		}
-		dlq.adopt(job)
+		return dlq.adopt(job)
 	}
 }
