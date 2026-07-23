@@ -38,12 +38,12 @@ func newTestTopic(t *testing.T) (*topic, *testClock, *[]*Job) {
 	clk := newTestClock()
 	var mu sync.Mutex
 	dead := &[]*Job{}
-	tp := newTopic("jobs", clk.Now, func(j *Job) bool {
+	tp := newTopic(topicConfig{name: "jobs", now: clk.Now, deadLetter: func(j *Job) bool {
 		mu.Lock()
 		*dead = append(*dead, j)
 		mu.Unlock()
 		return true
-	})
+	}})
 	t.Cleanup(tp.close)
 	return tp, clk, dead
 }

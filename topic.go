@@ -23,10 +23,26 @@ type topic struct {
 	// attempts; it reports whether the job actually arrived in the DLQ.
 	// nil on dead-letter topics themselves (no ".dlq.dlq" chains).
 	deadLetter func(*Job) bool
-
+	// logRec appends a WAL record; nil in in-memory mode. The actor never
+	// blocks on it: gated waiters are forwarded to the caller's reply
+	// channel by a helper goroutine, so fsync latency stalls the caller
+	// (as durability demands) but never the actor loop.
+	logRec    func(walRecord, bool) waiter
+	walID     uint32
+	initial   []*Job // restored jobs, already justified by the log
 	reqs      chan request
 	done      chan struct{}
 	closeOnce sync.Once
+}
+
+// topicConfig bundles newTopic's wiring; only name and now are required.
+type topicConfig struct {
+	name       string
+	now        func() time.Time
+	deadLetter func(*Job) bool
+	logRec     func(walRecord, bool) waiter
+	walID      uint32
+	initial    []*Job
 }
 
 // request is one operation for the actor loop. Exactly one field is set.
@@ -96,11 +112,14 @@ type inflight struct {
 	index    int // position in the deadline heap, maintained by heap.Interface
 }
 
-func newTopic(name string, now func() time.Time, deadLetter func(*Job) bool) *topic {
+func newTopic(cfg topicConfig) *topic {
 	t := &topic{
-		name:       name,
-		now:        now,
-		deadLetter: deadLetter,
+		name:       cfg.name,
+		now:        cfg.now,
+		deadLetter: cfg.deadLetter,
+		logRec:     cfg.logRec,
+		walID:      cfg.walID,
+		initial:    cfg.initial,
 		reqs:       make(chan request),
 		done:       make(chan struct{}),
 	}
@@ -108,14 +127,28 @@ func newTopic(name string, now func() time.Time, deadLetter func(*Job) bool) *to
 	return t
 }
 
+// log appends rec to the WAL if one is attached. Non-gated records return a
+// pre-resolved waiter, so this never blocks the actor.
+func (t *topic) log(rec walRecord, gated bool) waiter {
+	if t.logRec == nil {
+		done := make(waiter, 1)
+		done <- nil
+		return done
+	}
+	rec.TopicID = t.walID
+	return t.logRec(rec, gated)
+}
+
 // run is the actor loop: the only goroutine that touches topic state.
 func (t *topic) run() {
 	var (
-		ready    []*Job // FIFO; may contain not-yet-visible delayed jobs
+		ready    = t.initial // restored FIFO; state already justified by the log
 		leases   = map[string]*inflight{}
 		deadline = &deadlineHeap{}
 		stats    Stats
 	)
+	t.initial = nil
+	stats.Enqueued = len(ready)
 	heap.Init(deadline)
 
 	// expire returns leases whose deadline has passed to the ready list (or
@@ -172,7 +205,20 @@ func (t *topic) run() {
 				}
 				ready = append(ready, job)
 				stats.Enqueued++
-				r.reply <- enqueueResp{id: job.ID}
+				// Rule 1 of the durability contract: the enqueue must be
+				// durable before Enqueue returns (under SyncAlways). The
+				// waiter is forwarded off-loop so fsync stalls the caller,
+				// never the actor. The job is visible to consumers before
+				// the fsync lands; a crash in that window loses only an
+				// enqueue that was never acknowledged.
+				wait := t.log(walRecord{
+					Type: recEnqueue, JobID: job.ID,
+					MaxAttempts: job.MaxAttempts, At: now,
+					Delay: r.opts.Delay, Payload: job.Payload,
+				}, true)
+				go func(id string, reply chan enqueueResp) {
+					reply <- enqueueResp{id: id, err: <-wait}
+				}(job.ID, r.reply)
 
 			case req.adopt != nil:
 				job := req.adopt.job
@@ -210,6 +256,7 @@ func (t *topic) run() {
 				leases[fl.leaseID] = fl
 				heap.Push(deadline, fl)
 				stats.InFlight++
+				t.log(walRecord{Type: recDeliver, JobID: job.ID, Attempts: job.Attempts}, false)
 				copied := *job
 				copied.Payload = append([]byte(nil), job.Payload...)
 				r.reply <- dequeueResp{
@@ -236,6 +283,7 @@ func (t *topic) run() {
 					heap.Remove(deadline, fl.index)
 					stats.InFlight--
 					stats.Acked++
+					t.log(walRecord{Type: recAck, JobID: fl.job.ID}, false)
 					r.reply <- settleResp{}
 				case settleNack:
 					delete(leases, r.leaseID)
@@ -274,11 +322,15 @@ func (t *topic) retire(job *Job, ready *[]*Job, stats *Stats) {
 		job.DeadLetteredAt = t.now()
 		if t.deadLetter != nil && t.deadLetter(job) {
 			stats.DeadLetters++
+			// The ADOPT record is written by the queue's dead-letter
+			// handler, which knows the destination topic's WAL id.
 		} else {
 			stats.Dropped++
+			t.log(walRecord{Type: recDrop, JobID: job.ID}, false)
 		}
 		return
 	}
+	t.log(walRecord{Type: recRetry, JobID: job.ID, Attempts: job.Attempts}, false)
 	*ready = append(*ready, job)
 }
 
