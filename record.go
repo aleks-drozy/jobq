@@ -17,8 +17,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"hash/crc32"
+	"io"
 	"time"
 )
 
