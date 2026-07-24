@@ -5,7 +5,8 @@
 // Exactly-once delivery is deliberately not offered: a consumer that dies
 // after doing its work but before acking will see the job again. Consumers
 // that need effective-once semantics should key their side effects on
-// Job.ID and Job.Attempt. See docs/superpowers/specs for the reasoning.
+// Job.ID and Job.Attempt. See docs/specs/2026-07-22-jobq-design.md for the
+// reasoning.
 package jobq
 
 import (

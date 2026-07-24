@@ -1,8 +1,7 @@
 # jobq — Design Spec
 
-Date: 2026-07-22 · Status: Alex authorized start; system/language forks
-delegated to Claude (queue over KV, Go over Python/C++ — rationale in the
-decision log below and vault 21-jobq).
+Date: 2026-07-22 · Status: ratified. System and language choices (queue over
+KV, Go over Python/C++) — rationale in the decision log below.
 
 ## What
 

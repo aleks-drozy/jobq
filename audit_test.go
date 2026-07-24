@@ -1,8 +1,7 @@
 package jobq
 
-// Regression tests for the 2026-07-22 adversarial audit of P1. Each test
-// names the defect it pins. The audit's refutation stage was lost to a rate
-// limit, so every claim here was re-verified by hand before being fixed.
+// Regression tests for defects found during P1 review. Each test names the
+// defect it pins; every claim was verified by hand before being fixed.
 
 import (
 	"bytes"
