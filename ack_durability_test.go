@@ -27,8 +27,8 @@ func TestAckDoesNotReturnBeforeItsRecordIsDurable(t *testing.T) {
 		seen    []logged
 	)
 	tp := newTopic(topicConfig{
-		name: "jobs",
-		now:  clk.Now,
+		name:       "jobs",
+		now:        clk.Now,
 		deadLetter: func(j *Job) bool { return false },
 		logRec: func(rec walRecord, gated bool) waiter {
 			seen = append(seen, logged{rec, gated})
