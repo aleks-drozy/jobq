@@ -1,0 +1,306 @@
+// Package jobqhttp is an HTTP surface over a *jobq.Queue, and the Client
+// that talks to it. Server and client share this package so the wire types
+// in wire.go are declared exactly once.
+package jobqhttp
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"log"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aleks-drozy/jobq"
+)
+
+const (
+	defaultMaxPayload    = 1 << 20 // 1 MiB
+	defaultMaxWait       = 30 * time.Second
+	defaultMaxVisibility = 24 * time.Hour
+)
+
+type handlerOptions struct {
+	maxPayload    int64
+	maxWait       time.Duration
+	maxVisibility time.Duration
+	logger        *log.Logger
+
+	haveRecovery bool
+	recovery     jobq.RecoveryReport
+	dir          string
+	sync         string
+	startedAt    time.Time
+}
+
+// HandlerOption configures NewHandler.
+type HandlerOption func(*handlerOptions)
+
+// WithMaxPayload caps the enqueue body size (default 1 MiB). Enforced with
+// http.MaxBytesReader, so an oversize body is rejected while streaming, not
+// after being buffered in full.
+func WithMaxPayload(n int64) HandlerOption {
+	return func(o *handlerOptions) { o.maxPayload = n }
+}
+
+// WithMaxWait caps how long a dequeue's wait_ms may block the connection
+// (default 30s), regardless of what the caller asks for.
+func WithMaxWait(d time.Duration) HandlerOption {
+	return func(o *handlerOptions) { o.maxWait = d }
+}
+
+// WithMaxVisibility caps the visibility/extend duration a caller may request
+// (default 24h).
+func WithMaxVisibility(d time.Duration) HandlerOption {
+	return func(o *handlerOptions) { o.maxVisibility = d }
+}
+
+// WithLogger sets the logger used for server-side diagnostics (default
+// discards output).
+func WithLogger(l *log.Logger) HandlerOption {
+	return func(o *handlerOptions) { o.logger = l }
+}
+
+// WithRecovery attaches the RecoveryReport captured once at process start,
+// served by GET /v1/recovery, and marks the queue as durable for GET
+// /v1/health. Omit it for an in-memory queue (jobq.New): health then
+// reports durable:false and /v1/recovery reports a zero report with an
+// empty dir.
+func WithRecovery(report jobq.RecoveryReport, dir, sync string) HandlerOption {
+	return func(o *handlerOptions) {
+		o.haveRecovery = true
+		o.recovery = report
+		o.dir = dir
+		o.sync = sync
+	}
+}
+
+type handler struct {
+	q    *jobq.Queue
+	opts handlerOptions
+}
+
+// NewHandler builds the HTTP surface for q. See the package doc and
+// docs/specs/2026-07-30-jobq-p3-http.md for the route table and error
+// envelope shape.
+func NewHandler(q *jobq.Queue, opts ...HandlerOption) http.Handler {
+	o := handlerOptions{
+		maxPayload:    defaultMaxPayload,
+		maxWait:       defaultMaxWait,
+		maxVisibility: defaultMaxVisibility,
+		logger:        log.New(discardWriter{}, "", 0),
+		startedAt:     time.Now(),
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	h := &handler{q: q, opts: o}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/topics/{topic}/jobs", h.handleEnqueue)
+	mux.HandleFunc("POST /v1/topics/{topic}/dequeue", h.handleDequeue)
+	mux.HandleFunc("POST /v1/topics/{topic}/leases/{leaseID}/ack", h.handleAck)
+	mux.HandleFunc("POST /v1/topics/{topic}/leases/{leaseID}/nack", h.handleNack)
+	mux.HandleFunc("POST /v1/topics/{topic}/leases/{leaseID}/extend", h.handleExtend)
+	mux.HandleFunc("GET /v1/topics", h.handleTopics)
+	mux.HandleFunc("GET /v1/topics/{topic}/stats", h.handleTopicStats)
+	mux.HandleFunc("GET /v1/stats", h.handleStats)
+	mux.HandleFunc("GET /v1/health", h.handleHealth)
+	mux.HandleFunc("GET /v1/recovery", h.handleRecovery)
+	return mux
+}
+
+type discardWriter struct{}
+
+func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+// --- helpers -----------------------------------------------------------
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeErrorEnvelope(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, errorEnvelope{Error: errorBody{Code: code, Message: message}})
+}
+
+// writeEngineError maps a *Queue error (an engine sentinel or something
+// unexpected) to the response. Callers must special-case jobq.ErrNoJob
+// themselves — it is 204, not an error.
+func writeEngineError(w http.ResponseWriter, err error) {
+	status, code := statusAndCodeFor(err)
+	writeErrorEnvelope(w, status, code, err.Error())
+}
+
+// decodeJSON reads a JSON body with unknown fields rejected, under
+// maxPayload. A *http.MaxBytesError is reported to the caller so it can
+// answer 413 instead of the generic 400.
+func decodeJSON(w http.ResponseWriter, r *http.Request, maxPayload int64, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxPayload)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	return nil
+}
+
+func isMaxBytesError(err error) bool {
+	var mbe *http.MaxBytesError
+	return errors.As(err, &mbe)
+}
+
+func (h *handler) handleTopics(w http.ResponseWriter, r *http.Request) {
+	names := h.q.Topics()
+	sort.Strings(names)
+	writeJSON(w, http.StatusOK, topicsResponseDTO{Topics: names})
+}
+
+func (h *handler) handleTopicStats(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	writeJSON(w, http.StatusOK, h.q.Stats(topic))
+}
+
+func (h *handler) handleStats(w http.ResponseWriter, r *http.Request) {
+	names := h.q.Topics()
+	sort.Strings(names)
+	out := make(map[string]jobq.Stats, len(names))
+	for _, name := range names {
+		out[name] = h.q.Stats(name)
+	}
+	writeJSON(w, http.StatusOK, statsResponseDTO{Topics: out})
+}
+
+func (h *handler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, healthResponseDTO{
+		Status:   "ok",
+		Durable:  h.opts.haveRecovery,
+		UptimeMs: time.Since(h.opts.startedAt).Milliseconds(),
+	})
+}
+
+func (h *handler) handleRecovery(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, recoveryResponseDTO{
+		Report:    h.opts.recovery,
+		StartedAt: h.opts.startedAt,
+		Dir:       h.opts.dir,
+		Sync:      h.opts.sync,
+	})
+}
+
+func (h *handler) handleAck(w http.ResponseWriter, r *http.Request) {
+	lease := jobq.Lease{ID: r.PathValue("leaseID"), Topic: r.PathValue("topic")}
+	if err := h.q.Ack(lease); err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handler) handleNack(w http.ResponseWriter, r *http.Request) {
+	lease := jobq.Lease{ID: r.PathValue("leaseID"), Topic: r.PathValue("topic")}
+	if err := h.q.Nack(lease); err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handler) handleExtend(w http.ResponseWriter, r *http.Request) {
+	var req extendRequestDTO
+	if err := decodeJSON(w, r, h.opts.maxPayload, &req); err != nil {
+		if isMaxBytesError(err) {
+			writeErrorEnvelope(w, http.StatusRequestEntityTooLarge, "payload_too_large", err.Error())
+			return
+		}
+		writeErrorEnvelope(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	d := time.Duration(req.ByMs) * time.Millisecond
+	if h.opts.maxVisibility > 0 && d > h.opts.maxVisibility {
+		d = h.opts.maxVisibility
+	}
+	lease := jobq.Lease{ID: r.PathValue("leaseID"), Topic: r.PathValue("topic")}
+	deadline, err := h.q.Extend(lease, d)
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, extendResponseDTO{Deadline: deadline})
+}
+
+func (h *handler) handleEnqueue(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	ct := r.Header.Get("Content-Type")
+	mediaType := ct
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		mediaType = ct[:i]
+	}
+	mediaType = strings.TrimSpace(mediaType)
+
+	var payload []byte
+	var delay time.Duration
+	var maxAttempts int
+
+	if strings.EqualFold(mediaType, "application/json") {
+		var req enqueueJSONRequest
+		if err := decodeJSON(w, r, h.opts.maxPayload, &req); err != nil {
+			if isMaxBytesError(err) {
+				writeErrorEnvelope(w, http.StatusRequestEntityTooLarge, "payload_too_large", err.Error())
+				return
+			}
+			writeErrorEnvelope(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		payload = req.Payload
+		delay = time.Duration(req.DelayMs) * time.Millisecond
+		maxAttempts = req.MaxAttempts
+	} else {
+		r.Body = http.MaxBytesReader(w, r.Body, h.opts.maxPayload)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			if isMaxBytesError(err) {
+				writeErrorEnvelope(w, http.StatusRequestEntityTooLarge, "payload_too_large", err.Error())
+				return
+			}
+			writeErrorEnvelope(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		payload = body
+		if v := r.URL.Query().Get("delay_ms"); v != "" {
+			ms, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				writeErrorEnvelope(w, http.StatusBadRequest, "bad_request", "invalid delay_ms")
+				return
+			}
+			delay = time.Duration(ms) * time.Millisecond
+		}
+		if v := r.URL.Query().Get("max_attempts"); v != "" {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				writeErrorEnvelope(w, http.StatusBadRequest, "bad_request", "invalid max_attempts")
+				return
+			}
+			maxAttempts = int(n)
+		}
+	}
+
+	var opts []jobq.EnqueueOption
+	if delay > 0 {
+		opts = append(opts, jobq.WithDelay(delay))
+	}
+	if maxAttempts > 0 {
+		opts = append(opts, jobq.WithMaxAttempts(maxAttempts))
+	}
+	id, err := h.q.Enqueue(topic, payload, opts...)
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, enqueueResponseDTO{ID: id})
+}
