@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -96,22 +97,46 @@ func run(args []string) error {
 		be = jobqmcp.NewLocalBackend(q, report, *dir, *sync)
 		mode, show = "local", *dir
 	} else {
-		be = jobqhttp.NewClient(*addr)
+		be = newHTTPBackend(*addr, *maxWait)
 		mode, show = "http", *addr
 	}
 
-	server := jobqmcp.NewServer(be, jobqmcp.ServerOptions{
-		MaxWait:    maxWait.Milliseconds(),
-		MaxPayload: *maxPayload,
-		ReadOnly:   *readOnly,
-		Mode:       mode,
-		Addr:       *addr,
-	})
+	server := jobqmcp.NewServer(be, serverOptions(mode, *addr, *maxWait, *maxPayload, *readOnly))
 
 	log.Printf("jobq-mcp: mode=%s target=%s read-only=%v max-wait=%s max-payload=%d",
 		mode, show, *readOnly, maxWait, *maxPayload)
 
 	return server.Run(context.Background(), &sdk.StdioTransport{})
+}
+
+// newHTTPBackend builds the jobqhttp.Client used in -addr (http) mode. It
+// must not use jobqhttp.NewClient's default http.Client: that client's
+// hardcoded 10s Timeout is an absolute cap on the whole round trip, so any
+// wait_ms/-max-wait close to or above 10s would otherwise be silently
+// truncated by the HTTP layer before the server's own long-poll deadline
+// ever fires, turning a legitimate empty result into a spurious transport
+// error. Giving the client maxWait+10s of headroom mirrors the minTimeout
+// logic cmd/jobq/main.go already applies to the same problem for the jobq
+// CLI's --wait flag.
+func newHTTPBackend(addr string, maxWait time.Duration) jobqmcp.Backend {
+	return jobqhttp.NewClient(addr, jobqhttp.WithHTTPClient(&http.Client{Timeout: maxWait + 10*time.Second}))
+}
+
+// serverOptions builds the jobqmcp.ServerOptions for mode. Addr is set only
+// for "http" mode — mcp/server.go's ServerOptions doc says as much, and
+// jobq_health's addr field is omitempty specifically so embedded (-dir)
+// mode reports no address at all rather than a misleading one.
+func serverOptions(mode, addr string, maxWait time.Duration, maxPayload int, readOnly bool) jobqmcp.ServerOptions {
+	opts := jobqmcp.ServerOptions{
+		MaxWait:    maxWait.Milliseconds(),
+		MaxPayload: maxPayload,
+		ReadOnly:   readOnly,
+		Mode:       mode,
+	}
+	if mode == "http" {
+		opts.Addr = addr
+	}
+	return opts
 }
 
 func parseSyncPolicy(s string) (jobq.SyncPolicy, error) {
