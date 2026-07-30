@@ -45,7 +45,7 @@ type ServerOptions struct {
 	// under jobqd's own 1 MiB default; a quarter-megabyte payload from an
 	// LLM is a mistake, not a use case.
 	MaxPayload int
-	// ReadOnly registers only the six read-only tools (jobq_peek,
+	// ReadOnly registers only the five read-only tools (jobq_peek,
 	// jobq_list_topics, jobq_topic_stats, jobq_health,
 	// jobq_recovery_report) — no mutation is reachable at all.
 	ReadOnly bool

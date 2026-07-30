@@ -50,8 +50,8 @@ func run(args []string) error {
 	maxWait := fs.Duration("max-wait", 10*time.Second, "cap on jobq_dequeue's wait_ms, deliberately below "+
 		"typical MCP client tool-call timeouts")
 	maxPayload := fs.Int("max-payload", 256*1024, "cap on jobq_enqueue's payload size in bytes")
-	readOnly := fs.Bool("read-only", false, "register only the six read-only tools — no mutation is reachable "+
-		"at all. The right default for pointing this at anything real.")
+	readOnly := fs.Bool("read-only", false, "register only the five read-only tools — no mutation is reachable "+
+		"at all. Recommended whenever pointing this at a queue that matters.")
 	sync := fs.String("sync", "always", "fsync policy for -dir mode: always, interval, or never (see jobq.SyncPolicy)")
 
 	if err := fs.Parse(args); err != nil {
