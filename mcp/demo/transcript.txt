@@ -1,0 +1,382 @@
+working directory (kept): C:\Users\Alex\AppData\Local\Temp\jobq-demo-1816268354
+>>> building jobqd and jobq-mcp from source
+>>> starting jobqd -dir C:\Users\Alex\AppData\Local\Temp\jobq-demo-1816268354\data -addr 127.0.0.1:49704 -sync always
+>>> seeding 6 poison jobs and dead-lettering them for real, before the crash
+>>> seeding 5 jobs and leaving them leased — these are in flight when jobqd dies
+>>> seeding 30 ordinary jobs; acking 20 for real, leaving 10 ready
+seeded (ground truth, not shown to the agent): 6 poison job(s), 5 in-flight-at-kill job(s)
+>>> killing jobqd COLD — Process.Kill, no signal, no flush, mid-flight
+>>> removing the stale lock file jobqd's cold kill left behind (documented behavior: acquireDirLock only detects a live holder; a crash's lock is cleared by hand, on purpose)
+>>> restarting jobqd on the same directory
+
+=================================================================
+ RECORDING STARTS HERE — everything below is a real MCP client
+ talking to jobq-mcp, talking to the just-restarted jobqd.
+=================================================================
+
+AGENT PROMPT: "Something happened to the queue. Find out what, and get the work moving again without losing anything."
+
+MCP CALL: jobq_health
+  result: {
+    "addr": "http://127.0.0.1:49704",
+    "durable": true,
+    "mode": "http",
+    "status": "ok",
+    "uptime_ms": 705
+  }
+
+AGENT: durable=true, uptime_ms=705 — this process just started.
+
+MCP CALL: jobq_recovery_report
+  result: {
+    "dir": "C:\\Users\\Alex\\AppData\\Local\\Temp\\jobq-demo-1816268354\\data",
+    "interpretation": [
+      "clean_shutdown=false: the previous process did not shut down in an orderly way, though no torn write was found at the tail.",
+      "jobs_dead_lettered=5: those jobs were in flight when the process died AND had already consumed their last attempt, so replay dead-lettered them. Their dead_lettered_at is zero — the engine records no timestamp it cannot know.",
+      "jobs_restored=16: leases are not persisted; a restart expires every lease at once, so in-flight jobs returned to ready with attempt counts intact."
+    ],
+    "report": {
+      "bytes_truncated": 0,
+      "clean_shutdown": false,
+      "jobs_dead_lettered": 5,
+      "jobs_restored": 16,
+      "records_applied": 100,
+      "segments": 1,
+      "torn_tail": false
+    },
+    "started_at": "2026-07-30T14:10:33.6436451+01:00",
+    "sync": "always"
+  }
+
+AGENT reads the interpretation:
+  - clean_shutdown=false: the previous process did not shut down in an orderly way, though no torn write was found at the tail.
+  - jobs_dead_lettered=5: those jobs were in flight when the process died AND had already consumed their last attempt, so replay dead-lettered them. Their dead_lettered_at is zero — the engine records no timestamp it cannot know.
+  - jobs_restored=16: leases are not persisted; a restart expires every lease at once, so in-flight jobs returned to ready with attempt counts intact.
+
+MCP CALL: jobq_list_topics
+  result: {
+    "dlq_topics": [
+      "emails.dlq"
+    ],
+    "topics": [
+      "emails"
+    ]
+  }
+
+MCP CALL: jobq_topic_stats
+  result: {
+    "topics": {
+      "emails": {
+        "acked": 0,
+        "dead_letters": 0,
+        "dropped": 0,
+        "enqueued": 10,
+        "in_flight": 0,
+        "ready": 10
+      },
+      "emails.dlq": {
+        "acked": 0,
+        "dead_letters": 0,
+        "dropped": 0,
+        "enqueued": 11,
+        "in_flight": 0,
+        "ready": 11
+      }
+    }
+  }
+
+AGENT: that's the shape of the damage. Time to look inside the DLQ — read-only.
+
+MCP CALL: jobq_peek
+  args:   {"limit":20,"topic":"emails.dlq"}
+  result: {
+    "ready": [
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_at": "2026-07-30T13:10:33.5322768Z",
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5278713Z",
+        "id": "53b8b2cef8cd903339795fb267668288",
+        "max_attempts": 5,
+        "payload": "POISON: malformed payload #0",
+        "payload_bytes": 28,
+        "topic": "emails.dlq"
+      },
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_at": "2026-07-30T13:10:33.5356514Z",
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5328343Z",
+        "id": "d4918a97b221bc0b4075ec1e9283f280",
+        "max_attempts": 5,
+        "payload": "POISON: malformed payload #1",
+        "payload_bytes": 28,
+        "topic": "emails.dlq"
+      },
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_at": "2026-07-30T13:10:33.5378348Z",
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5356514Z",
+        "id": "ce1c7834e0b87753b02e0fa44e98ffc7",
+        "max_attempts": 5,
+        "payload": "POISON: malformed payload #2",
+        "payload_bytes": 28,
+        "topic": "emails.dlq"
+      },
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_at": "2026-07-30T13:10:33.5405891Z",
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5383893Z",
+        "id": "de095a09c3e18d208057c48ac70c4824",
+        "max_attempts": 5,
+        "payload": "POISON: malformed payload #3",
+        "payload_bytes": 28,
+        "topic": "emails.dlq"
+      },
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_at": "2026-07-30T13:10:33.5433749Z",
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5411494Z",
+        "id": "26484e3fb03eb2be94bb4107ca491913",
+        "max_attempts": 5,
+        "payload": "POISON: malformed payload #4",
+        "payload_bytes": 28,
+        "topic": "emails.dlq"
+      },
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_at": "2026-07-30T13:10:33.5462108Z",
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5433749Z",
+        "id": "c29b56cf4b99f68bcd79c834b184a17e",
+        "max_attempts": 5,
+        "payload": "POISON: malformed payload #5",
+        "payload_bytes": 28,
+        "topic": "emails.dlq"
+      },
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5473493Z",
+        "id": "07965ab2778776b1a7c5b69228277dea",
+        "max_attempts": 5,
+        "payload": "send welcome email #0",
+        "payload_bytes": 21,
+        "topic": "emails.dlq"
+      },
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5489794Z",
+        "id": "30f960a8d9e4e21a8aac8faed22baa36",
+        "max_attempts": 5,
+        "payload": "send welcome email #1",
+        "payload_bytes": 21,
+        "topic": "emails.dlq"
+      },
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5506191Z",
+        "id": "1875783dbbe3705ca3d3c0c7c66d6eb3",
+        "max_attempts": 5,
+        "payload": "send welcome email #2",
+        "payload_bytes": 21,
+        "topic": "emails.dlq"
+      },
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5523299Z",
+        "id": "92bf2c9b272880870cd485df9f3ed03f",
+        "max_attempts": 5,
+        "payload": "send welcome email #3",
+        "payload_bytes": 21,
+        "topic": "emails.dlq"
+      },
+      {
+        "attempt": 0,
+        "attempts": 0,
+        "dead_lettered_attempts": 1,
+        "enqueued_at": "2026-07-30T13:10:33.5540254Z",
+        "id": "39c3621c9d430914f5d94ebe1b6dedfe",
+        "max_attempts": 5,
+        "payload": "send welcome email #4",
+        "payload_bytes": 21,
+        "topic": "emails.dlq"
+      }
+    ],
+    "topic": "emails.dlq",
+    "truncated": false
+  }
+
+AGENT partitions the DLQ by dead_lettered_at:
+  6 jobs have a real timestamp -> failed for real, in the application, before the crash. Leave them for a human.
+  5 jobs have a ZERO timestamp -> dead-lettered by REPLAY: in flight when the process died, with their
+    last attempt already spent. The engine refused to fabricate a timestamp it did not have. These are
+    crash victims, not poison — safe to requeue.
+
+MCP CALL: jobq_dlq_requeue
+  args:   {"job_ids":["07965ab2778776b1a7c5b69228277dea","30f960a8d9e4e21a8aac8faed22baa36","1875783dbbe3705ca3d3c0c7c66d6eb3","92bf2c9b272880870cd485df9f3ed03f","39c3621c9d430914f5d94ebe1b6dedfe"],"topic":"emails"}
+  result: {
+    "remaining_in_dlq": 7,
+    "requeued": [
+      {
+        "dlq_job_id": "07965ab2778776b1a7c5b69228277dea",
+        "new_job_id": "83c45083cd3cc6e1437d93901da043fd",
+        "payload_bytes": 21
+      },
+      {
+        "dlq_job_id": "30f960a8d9e4e21a8aac8faed22baa36",
+        "new_job_id": "31dc3ec40fcae0a53fca80050c01ee80",
+        "payload_bytes": 21
+      },
+      {
+        "dlq_job_id": "1875783dbbe3705ca3d3c0c7c66d6eb3",
+        "new_job_id": "c96799f8d677b5c3ff15da1fd8234960",
+        "payload_bytes": 21
+      },
+      {
+        "dlq_job_id": "92bf2c9b272880870cd485df9f3ed03f",
+        "new_job_id": "f45840af7d6b31141619f6f473592781",
+        "payload_bytes": 21
+      }
+    ],
+    "skipped": [
+      {
+        "dlq_job_id": "53b8b2cef8cd903339795fb267668288",
+        "reason": "not in job_ids"
+      },
+      {
+        "dlq_job_id": "d4918a97b221bc0b4075ec1e9283f280",
+        "reason": "not in job_ids"
+      },
+      {
+        "dlq_job_id": "ce1c7834e0b87753b02e0fa44e98ffc7",
+        "reason": "not in job_ids"
+      },
+      {
+        "dlq_job_id": "de095a09c3e18d208057c48ac70c4824",
+        "reason": "not in job_ids"
+      },
+      {
+        "dlq_job_id": "26484e3fb03eb2be94bb4107ca491913",
+        "reason": "not in job_ids"
+      },
+      {
+        "dlq_job_id": "c29b56cf4b99f68bcd79c834b184a17e",
+        "reason": "not in job_ids"
+      }
+    ]
+  }
+
+
+>>> lease-expiry verification: does redelivery still work post-recovery?
+MCP CALL: jobq_dequeue
+  args:   {"topic":"lease-check","visibility_ms":1500}
+  result: {
+    "empty": false,
+    "job": {
+      "attempt": 1,
+      "attempts": 1,
+      "enqueued_at": "2026-07-30T14:10:34.3759206+01:00",
+      "id": "5165949b45ed46a5380944f0ec31e7c0",
+      "max_attempts": 5,
+      "payload": "verify redelivery",
+      "payload_bytes": 17,
+      "topic": "lease-check"
+    },
+    "lease": {
+      "deadline": "2026-07-30T14:10:35.8775016+01:00",
+      "id": "e570b4e95e766cd43c0f2175a69ba7b6",
+      "job_id": "5165949b45ed46a5380944f0ec31e7c0",
+      "topic": "lease-check"
+    }
+  }
+
+MCP CALL: jobq_topic_stats
+  args:   {"topic":"lease-check"}
+  result: {
+    "topics": {
+      "lease-check": {
+        "acked": 0,
+        "dead_letters": 0,
+        "dropped": 0,
+        "enqueued": 1,
+        "in_flight": 1,
+        "ready": 0
+      }
+    }
+  }
+
+AGENT: in_flight=1, as expected — deliberately not acking. Waiting for the lease to expire...
+MCP CALL: jobq_dequeue
+  args:   {"topic":"lease-check"}
+  result: {
+    "empty": false,
+    "job": {
+      "attempt": 2,
+      "attempts": 2,
+      "enqueued_at": "2026-07-30T14:10:34.3759206+01:00",
+      "id": "5165949b45ed46a5380944f0ec31e7c0",
+      "max_attempts": 5,
+      "payload": "verify redelivery",
+      "payload_bytes": 17,
+      "topic": "lease-check"
+    },
+    "lease": {
+      "deadline": "2026-07-30T14:11:06.1811289+01:00",
+      "id": "05c76f8560df734c45d1881f8c7c0fbf",
+      "job_id": "5165949b45ed46a5380944f0ec31e7c0",
+      "topic": "lease-check"
+    }
+  }
+
+AGENT: attempt=2 after the lease expired — redelivery confirmed working post-recovery.
+
+>>> closing reconciliation: enqueued == acked + ready + in_flight + dead_letters + dropped
+MCP CALL: jobq_topic_stats
+  result: {
+    "topics": {
+      "emails": {
+        "acked": 0,
+        "dead_letters": 0,
+        "dropped": 0,
+        "enqueued": 14,
+        "in_flight": 0,
+        "ready": 14
+      },
+      "emails.dlq": {
+        "acked": 4,
+        "dead_letters": 0,
+        "dropped": 0,
+        "enqueued": 11,
+        "in_flight": 0,
+        "ready": 7
+      },
+      "lease-check": {
+        "acked": 1,
+        "dead_letters": 0,
+        "dropped": 0,
+        "enqueued": 1,
+        "in_flight": 0,
+        "ready": 0
+      }
+    }
+  }
+
+AGENT: sum over every topic — enqueued=26, acked+ready+in_flight+dead_letters+dropped=26 (5+21+0+0+0)
+AGENT: conservation holds. Every job that entered the queue is accounted for in exactly one place.

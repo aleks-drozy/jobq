@@ -127,8 +127,14 @@ func TestEnqueueUnknownJSONFieldIs400(t *testing.T) {
 }
 
 func TestWrongMethodIs405(t *testing.T) {
+	// PUT is registered on neither the enqueue (POST) nor the peek (GET)
+	// handler for this path, so the mux itself must reject it.
 	_, srv := newTestServer(t)
-	resp, err := srv.Client().Get(srv.URL + "/v1/topics/emails/jobs")
+	req, err := http.NewRequest(http.MethodPut, srv.URL+"/v1/topics/emails/jobs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

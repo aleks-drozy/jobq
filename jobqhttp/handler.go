@@ -21,6 +21,9 @@ const (
 	defaultMaxPayload    = 1 << 20 // 1 MiB
 	defaultMaxWait       = 30 * time.Second
 	defaultMaxVisibility = 24 * time.Hour
+
+	defaultPeekLimit = 10
+	maxPeekLimit     = 100
 )
 
 type handlerOptions struct {
@@ -105,6 +108,7 @@ func NewHandler(q *jobq.Queue, opts ...HandlerOption) http.Handler {
 	mux.HandleFunc("POST /v1/topics/{topic}/leases/{leaseID}/ack", h.handleAck)
 	mux.HandleFunc("POST /v1/topics/{topic}/leases/{leaseID}/nack", h.handleNack)
 	mux.HandleFunc("POST /v1/topics/{topic}/leases/{leaseID}/extend", h.handleExtend)
+	mux.HandleFunc("GET /v1/topics/{topic}/jobs", h.handlePeek)
 	mux.HandleFunc("GET /v1/topics", h.handleTopics)
 	mux.HandleFunc("GET /v1/topics/{topic}/stats", h.handleTopicStats)
 	mux.HandleFunc("GET /v1/stats", h.handleStats)
@@ -164,6 +168,65 @@ func (h *handler) handleTopics(w http.ResponseWriter, r *http.Request) {
 func (h *handler) handleTopicStats(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	writeJSON(w, http.StatusOK, h.q.Stats(topic))
+}
+
+// handlePeek implements GET /v1/topics/{topic}/jobs — read-only inspection.
+// It never leases, mutates, or logs anything (see Queue.Peek's doc for why
+// that matters for a DLQ). limit defaults to 10 and is capped at 100;
+// fetching one extra job internally is how Truncated is computed without
+// widening jobq.Queue.Peek's own signature.
+func (h *handler) handlePeek(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+
+	limit := defaultPeekLimit
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeErrorEnvelope(w, http.StatusBadRequest, "bad_request", "invalid limit")
+			return
+		}
+		limit = n
+	}
+	if limit > maxPeekLimit {
+		limit = maxPeekLimit
+	}
+
+	includeInflight := false
+	if v := r.URL.Query().Get("include_inflight"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			writeErrorEnvelope(w, http.StatusBadRequest, "bad_request", "invalid include_inflight")
+			return
+		}
+		includeInflight = b
+	}
+
+	ready, inflight, err := h.q.Peek(topic, limit+1, includeInflight)
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	truncated := false
+	if len(ready) > limit {
+		truncated = true
+		ready = ready[:limit]
+	}
+	if len(inflight) > limit {
+		truncated = true
+		inflight = inflight[:limit]
+	}
+
+	resp := peekResponseDTO{Ready: make([]jobDTO, len(ready)), Truncated: truncated}
+	for i, j := range ready {
+		resp.Ready[i] = jobToDTO(j)
+	}
+	if includeInflight {
+		resp.Inflight = make([]jobDTO, len(inflight))
+		for i, j := range inflight {
+			resp.Inflight[i] = jobToDTO(j)
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *handler) handleStats(w http.ResponseWriter, r *http.Request) {

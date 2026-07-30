@@ -51,6 +51,7 @@ type request struct {
 	adopt   *adoptReq
 	dequeue *dequeueReq
 	settle  *settleReq
+	peek    *peekReq
 	stats   chan Stats
 }
 
@@ -102,6 +103,22 @@ type settleReq struct {
 type settleResp struct {
 	deadline time.Time // effective lease deadline after an extend
 	err      error
+}
+
+// peekReq is a read-only inspection: it never mutates queue state, takes no
+// lease, consumes no attempt, and writes nothing to the log. It exists
+// because Dequeue is the only read path and Dequeue mutates (Attempts++),
+// which makes "just look at the DLQ" destructive — see queue.go's Peek doc.
+type peekReq struct {
+	limit           int
+	includeInflight bool
+	reply           chan peekResp
+}
+
+type peekResp struct {
+	ready     []*Job
+	inflight  []*Job
+	truncated bool
 }
 
 // inflight is a leased job awaiting settlement.
@@ -313,6 +330,39 @@ func (t *topic) run() {
 					r.reply <- settleResp{deadline: fl.deadline}
 				}
 
+			case req.peek != nil:
+				r := req.peek
+				expire() // same discipline as stats: settle expiry before reading
+				limit := r.limit
+				n := len(ready)
+				truncated := false
+				if limit > 0 && n > limit {
+					n = limit
+					truncated = true
+				}
+				readyOut := make([]*Job, n)
+				for i := 0; i < n; i++ {
+					copied := *ready[i]
+					copied.Payload = append([]byte(nil), ready[i].Payload...)
+					readyOut[i] = &copied
+				}
+				var inflightOut []*Job
+				if r.includeInflight {
+					m := len(*deadline)
+					if limit > 0 && m > limit {
+						m = limit
+						truncated = true
+					}
+					inflightOut = make([]*Job, m)
+					for i := 0; i < m; i++ {
+						job := (*deadline)[i].job
+						copied := *job
+						copied.Payload = append([]byte(nil), job.Payload...)
+						inflightOut[i] = &copied
+					}
+				}
+				r.reply <- peekResp{ready: readyOut, inflight: inflightOut, truncated: truncated}
+
 			case req.stats != nil:
 				expire()
 				snapshot := stats
@@ -398,6 +448,17 @@ func (t *topic) settle(kind settleKind, leaseID string, d time.Duration) (time.T
 	}
 	resp := <-reply
 	return resp.deadline, resp.err
+}
+
+// peek is read-only: no lease, no attempt consumed, no WAL record. See
+// queue.go's Peek doc for why this exists.
+func (t *topic) peek(limit int, includeInflight bool) ([]*Job, []*Job, bool, error) {
+	reply := make(chan peekResp, 1)
+	if err := t.send(request{peek: &peekReq{limit: limit, includeInflight: includeInflight, reply: reply}}); err != nil {
+		return nil, nil, false, err
+	}
+	resp := <-reply
+	return resp.ready, resp.inflight, resp.truncated, nil
 }
 
 func (t *topic) stats() Stats {

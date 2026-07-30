@@ -7,13 +7,15 @@ per-job attempt budgets, delayed jobs, and dead-letter queues — built to be
 explained, not just to run. The design decisions, the failure modes, and the
 costs of each are documented rather than assumed.
 
-**Status: P3 complete — HTTP + CLI.** A segmented, CRC-checked write-ahead
-log with group commit, deterministic replay, and a crash harness that kills
-the process cold and proves nothing acknowledged is lost — plus an HTTP
-surface (`cmd/jobqd`) and a CLI (`cmd/jobq`) that runs jobs for real,
-retries them, and dead-letters them, live, in a terminal. MCP is
-deliberately deferred (see `docs/specs/2026-07-30-jobq-p3-http.md`); P4 is
-the full design deep-dive.
+**Status: P3.5 complete — HTTP + CLI + MCP.** A segmented, CRC-checked
+write-ahead log with group commit, deterministic replay, and a crash
+harness that kills the process cold and proves nothing acknowledged is
+lost — plus an HTTP surface (`cmd/jobqd`), a CLI (`cmd/jobq`) that runs
+jobs for real, retries them, and dead-letters them live in a terminal, and
+an MCP server (`mcp/`, own module, own dependencies — see below) that lets
+an agent enqueue, inspect, and recover a queue through eleven typed tools.
+See `mcp/README.md` and `mcp/demo/` for a real crash, a real recovery, and
+a real MCP client diagnosing it. P4 is the full design deep-dive.
 
 ```go
 q, report, _ := jobq.Open("./data", jobq.WithSync(jobq.SyncAlways))
@@ -173,11 +175,21 @@ counting, and DLQ routing can't quietly diverge between the two;
 HTTP workers under `-race`; `restart_test.go` ties the HTTP surface to P2's
 durability guarantee directly.
 
+## MCP
+
+`mcp/` is an MCP server over this queue, built on the official
+`github.com/modelcontextprotocol/go-sdk`. It is a **separate Go module**
+(`github.com/aleks-drozy/jobq/mcp`, with its own `go.mod`) specifically so
+this root module's "standard library only" claim stays true — `go list -m all`
+here prints exactly `github.com/aleks-drozy/jobq`, and CI checks that, not
+just this sentence. See `mcp/README.md` for the eleven tools, and
+`docs/specs/2026-07-31-jobq-p3.5-mcp.md` for why MCP was deferred in P3 and
+isn't anymore, why it needed one new engine primitive (`Queue.Peek` — a
+read-only inspection path, because `Dequeue` is the only other one and it
+mutates), and the crash-recovery-diagnosis demo in `mcp/demo/`.
+
 ## Not in v1
 
 Replication, clustering, consumer-group fan-out, priorities, cron
-scheduling, authentication, TLS, rate limiting. An MCP surface is deferred,
-not rejected — `jobq.Client` (the five-method interface `*jobq.Queue` and
-`jobqhttp.Client` both implement) is the seam a future `cmd/jobq-mcp` would
-sit behind; see `docs/specs/2026-07-30-jobq-p3-http.md` for why P3 shipped
-HTTP+CLI instead. Single node, one machine, done properly.
+scheduling, authentication, TLS, rate limiting. Single node, one machine,
+done properly.

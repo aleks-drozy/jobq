@@ -211,6 +211,26 @@ func (q *Queue) Stats(topicName string) Stats {
 	return tp.stats()
 }
 
+// Peek returns up to limit jobs from the head of topic's ready list, and
+// optionally its in-flight jobs, without leasing, mutating, or logging
+// anything. It is the only read path into a topic that Dequeue doesn't also
+// mutate: Dequeue increments Job.Attempts on every call, so "just look at
+// the DLQ" via Dequeue-then-Nack burns the job's attempt budget on every
+// look — five peeks permanently destroys a DefaultMaxAttempts job. Peek
+// exists so inspection is actually free. An unknown topic reports no jobs,
+// matching Stats. limit <= 0 means unlimited.
+func (q *Queue) Peek(topicName string, limit int, includeInflight bool) (ready, inflight []*Job, err error) {
+	tp, err := q.topicFor(topicName, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	if tp == nil {
+		return nil, nil, nil
+	}
+	ready, inflight, _, err = tp.peek(limit, includeInflight)
+	return ready, inflight, err
+}
+
 // Topics lists the known topic names, including dead-letter topics.
 func (q *Queue) Topics() []string {
 	q.mu.RLock()

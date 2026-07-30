@@ -128,6 +128,15 @@ type recoveryResponseDTO struct {
 	Sync      string              `json:"sync"`
 }
 
+// peekResponseDTO is the body for GET .../jobs — read-only inspection, no
+// lease, no attempt consumed. Truncated is true when more jobs exist than
+// limit allowed through.
+type peekResponseDTO struct {
+	Ready     []jobDTO `json:"ready"`
+	Inflight  []jobDTO `json:"inflight"`
+	Truncated bool     `json:"truncated"`
+}
+
 // errorEnvelope is the one error shape used everywhere in the API.
 type errorEnvelope struct {
 	Error errorBody `json:"error"`

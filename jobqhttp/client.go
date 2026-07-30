@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -152,6 +153,36 @@ func (c *Client) Stats() (map[string]jobq.Stats, error) {
 		return nil, err
 	}
 	return resp.Topics, nil
+}
+
+// Peek fetches up to limit ready jobs (and optionally in-flight jobs) from
+// topic without leasing, mutating, or consuming an attempt. Not part of
+// jobq.Client — see jobq.Queue.Peek's doc for why this exists.
+func (c *Client) Peek(topic string, limit int, includeInflight bool) (ready, inflight []*jobq.Job, truncated bool, err error) {
+	q := url.Values{}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if includeInflight {
+		q.Set("include_inflight", "true")
+	}
+	path := "/v1/topics/" + url.PathEscape(topic) + "/jobs"
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	var resp peekResponseDTO
+	if err := c.doJSON(context.Background(), http.MethodGet, path, nil, &resp, http.StatusOK); err != nil {
+		return nil, nil, false, err
+	}
+	ready = make([]*jobq.Job, len(resp.Ready))
+	for i, d := range resp.Ready {
+		ready[i] = dtoToJob(d)
+	}
+	inflight = make([]*jobq.Job, len(resp.Inflight))
+	for i, d := range resp.Inflight {
+		inflight[i] = dtoToJob(d)
+	}
+	return ready, inflight, resp.Truncated, nil
 }
 
 // Health fetches server health.
