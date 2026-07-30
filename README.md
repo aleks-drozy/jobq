@@ -7,10 +7,13 @@ per-job attempt budgets, delayed jobs, and dead-letter queues — built to be
 explained, not just to run. The design decisions, the failure modes, and the
 costs of each are documented rather than assumed.
 
-**Status: P2 complete — durable.** A segmented, CRC-checked write-ahead log
-with group commit, deterministic replay, and a crash harness that kills the
-process cold and proves nothing acknowledged is lost. P3 adds an HTTP
-surface, P4 the full design deep-dive.
+**Status: P3 complete — HTTP + CLI.** A segmented, CRC-checked write-ahead
+log with group commit, deterministic replay, and a crash harness that kills
+the process cold and proves nothing acknowledged is lost — plus an HTTP
+surface (`cmd/jobqd`) and a CLI (`cmd/jobq`) that runs jobs for real,
+retries them, and dead-letters them, live, in a terminal. MCP is
+deliberately deferred (see `docs/specs/2026-07-30-jobq-p3-http.md`); P4 is
+the full design deep-dive.
 
 ```go
 q, report, _ := jobq.Open("./data", jobq.WithSync(jobq.SyncAlways))
@@ -30,6 +33,43 @@ if err == nil {
     }
 }
 ```
+
+## Quickstart: a queue you can actually run
+
+```sh
+go build -o jobqd.exe ./cmd/jobqd
+go build -o jobq.exe  ./cmd/jobq
+
+./jobqd.exe -dir ./data &        # durable, binds 127.0.0.1:8080 by default
+
+./jobq.exe enqueue --payload '{"to":"a@b.ie"}' --max-attempts 3 emails
+./jobq.exe dequeue --wait 5s emails
+./jobq.exe stats emails
+
+# curl works too — the enqueue body is the raw payload when
+# Content-Type isn't application/json:
+curl -X POST http://127.0.0.1:8080/v1/topics/emails/jobs -d 'hello'
+```
+
+`jobq work` is the fastest way to see the whole P1 contract (retries,
+attempt budgets, dead-lettering) happen live: point it at a command that
+exits non-zero on purpose and watch a job retry, exhaust its attempts, and
+land in `emails.dlq`.
+
+```sh
+# a "worker" that always fails, to watch retries burn the budget
+./jobq.exe enqueue --max-attempts 3 emails --payload poison
+./jobq.exe work emails -- sh -c 'exit 1'
+./jobq.exe stats emails   # DeadLetters: 1
+```
+
+The payload arrives on the worker's stdin; `JOBQ_JOB_ID`, `JOBQ_TOPIC`,
+`JOBQ_ATTEMPT`, and `JOBQ_MAX_ATTEMPTS` arrive in its environment. Exit 0
+acks, non-zero nacks — a SIGINT while a job is running nacks it too,
+instead of abandoning it to lease expiry.
+
+There is no authentication (see "Not in v1" below), which is why `jobqd`
+binds `127.0.0.1` by default rather than `0.0.0.0`.
 
 ## Design decisions
 
@@ -125,7 +165,19 @@ Beyond per-behaviour table tests, two properties are checked directly:
   superseded lease is rejected at settle time. The test asserts it actually
   witnessed an overlap, so it cannot silently stop testing the scenario.
 
+P3 adds the same discipline over HTTP: `roundtrip_test.go` runs one
+behaviour suite twice — once against `*jobq.Queue`, once against
+`*jobqhttp.Client` over a live server — so sentinel errors, attempt
+counting, and DLQ routing can't quietly diverge between the two;
+`conservation_test.go` reruns the conservation property with concurrent
+HTTP workers under `-race`; `restart_test.go` ties the HTTP surface to P2's
+durability guarantee directly.
+
 ## Not in v1
 
-Replication, clustering, consumer-group fan-out, priorities, cron scheduling,
-authentication. Single node, one machine, done properly.
+Replication, clustering, consumer-group fan-out, priorities, cron
+scheduling, authentication, TLS, rate limiting. An MCP surface is deferred,
+not rejected — `jobq.Client` (the five-method interface `*jobq.Queue` and
+`jobqhttp.Client` both implement) is the seam a future `cmd/jobq-mcp` would
+sit behind; see `docs/specs/2026-07-30-jobq-p3-http.md` for why P3 shipped
+HTTP+CLI instead. Single node, one machine, done properly.
