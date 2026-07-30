@@ -107,6 +107,12 @@ returns (under `SyncAlways`), and an acked job never comes back. Everything
 else can be lost and re-derived at the cost of a duplicate, which
 at-least-once permits.
 
+**Payloads are stored unencrypted.** The WAL directory and its segment/lock
+files are created with restrictive permissions (`0700`/`0600`, owner-only),
+but job payload bytes themselves are written to disk in plain text — there
+is no at-rest encryption. Do not enqueue secrets or other sensitive data
+without encrypting them yourself before calling `Enqueue`.
+
 **Restarts expire every lease.** Leases are not persisted: a job in flight
 at crash time returns to ready with its attempt count intact — or
 dead-letters, if the crash consumed its last attempt. Recovery introduces no

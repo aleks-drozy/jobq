@@ -126,7 +126,7 @@ func (w *segmentWriter) rotate() error {
 		}
 	}
 	path := filepath.Join(w.dir, fmt.Sprintf("%016x.seg", w.offset))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

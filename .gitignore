@@ -1,0 +1,16 @@
+# Durable data directories produced by following the README quickstart
+# (jobqd -dir ./data, jobq-mcp -dir ./data, etc.) — real payload bytes,
+# never meant to be committed.
+/data/
+
+# Built binaries (Windows and Unix names). Anchored to the repo root and
+# mcp/cmd/jobq-mcp so these don't shadow the identically named source
+# directories (cmd/jobqd, cmd/jobq, mcp/cmd/jobq-mcp).
+*.exe
+/jobqd
+/jobq
+/mcp/cmd/jobq-mcp/jobq-mcp
+
+# WAL segment files, in case a data directory ends up somewhere git would
+# otherwise see it.
+*.seg

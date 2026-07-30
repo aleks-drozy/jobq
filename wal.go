@@ -66,7 +66,7 @@ type wal struct {
 
 func walSubdir(dir string) string { return filepath.Join(dir, "wal") }
 
-func ensureWALDir(dir string) error { return os.MkdirAll(walSubdir(dir), 0o755) }
+func ensureWALDir(dir string) error { return os.MkdirAll(walSubdir(dir), 0o700) }
 
 func openWAL(dir string, opts walOptions) (*wal, error) {
 	if err := ensureWALDir(dir); err != nil {
@@ -278,7 +278,7 @@ func (b *frameBuffer) Write(p []byte) (int, error) {
 // error says exactly that.
 func acquireDirLock(dir string) (*os.File, error) {
 	path := filepath.Join(dir, "jobq.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		if os.IsExist(err) {
 			return nil, fmt.Errorf("jobq: %s is locked by another process "+

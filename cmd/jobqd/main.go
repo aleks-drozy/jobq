@@ -121,7 +121,17 @@ func openQueue(c config, logger *log.Logger) (*jobq.Queue, []jobqhttp.HandlerOpt
 // with ErrClosed/503; in this order, Close also gets to write CLEANSHUT, so
 // the next Open reports a clean shutdown instead of a torn tail.
 func serve(ctx context.Context, ln net.Listener, h http.Handler, shutdownTimeout time.Duration, logger *log.Logger) error {
-	srv := &http.Server{Handler: h}
+	srv := &http.Server{
+		Handler: h,
+		// ReadHeaderTimeout and IdleTimeout guard against a Slowloris-style
+		// client holding a connection open without ever finishing its
+		// request headers or reusing it. No WriteTimeout: a long-poll
+		// dequeue (-max-wait, up to 30s by default) legitimately holds the
+		// response open for that long, and http.Server.WriteTimeout would
+		// cut it off mid-wait.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
