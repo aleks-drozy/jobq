@@ -1,6 +1,6 @@
-working directory (kept): C:\Users\Alex\AppData\Local\Temp\jobq-demo-1816268354
+working directory (kept): C:\Users\Alex\AppData\Local\Temp\jobq-demo-655221272
 >>> building jobqd and jobq-mcp from source
->>> starting jobqd -dir C:\Users\Alex\AppData\Local\Temp\jobq-demo-1816268354\data -addr 127.0.0.1:49704 -sync always
+>>> starting jobqd -dir C:\Users\Alex\AppData\Local\Temp\jobq-demo-655221272\data -addr 127.0.0.1:52664 -sync always
 >>> seeding 6 poison jobs and dead-lettering them for real, before the crash
 >>> seeding 5 jobs and leaving them leased — these are in flight when jobqd dies
 >>> seeding 30 ordinary jobs; acking 20 for real, leaving 10 ready
@@ -18,18 +18,18 @@ AGENT PROMPT: "Something happened to the queue. Find out what, and get the work 
 
 MCP CALL: jobq_health
   result: {
-    "addr": "http://127.0.0.1:49704",
+    "addr": "http://127.0.0.1:52664",
     "durable": true,
     "mode": "http",
     "status": "ok",
-    "uptime_ms": 705
+    "uptime_ms": 695
   }
 
-AGENT: durable=true, uptime_ms=705 — this process just started.
+AGENT: durable=true, uptime_ms=695 — this process just started.
 
 MCP CALL: jobq_recovery_report
   result: {
-    "dir": "C:\\Users\\Alex\\AppData\\Local\\Temp\\jobq-demo-1816268354\\data",
+    "dir": "C:\\Users\\Alex\\AppData\\Local\\Temp\\jobq-demo-655221272\\data",
     "interpretation": [
       "clean_shutdown=false: the previous process did not shut down in an orderly way, though no torn write was found at the tail.",
       "jobs_dead_lettered=5: those jobs were in flight when the process died AND had already consumed their last attempt, so replay dead-lettered them. Their dead_lettered_at is zero — the engine records no timestamp it cannot know.",
@@ -44,7 +44,7 @@ MCP CALL: jobq_recovery_report
       "segments": 1,
       "torn_tail": false
     },
-    "started_at": "2026-07-30T14:10:33.6436451+01:00",
+    "started_at": "2026-07-31T10:19:45.0168728+01:00",
     "sync": "always"
   }
 
@@ -94,10 +94,10 @@ MCP CALL: jobq_peek
       {
         "attempt": 0,
         "attempts": 0,
-        "dead_lettered_at": "2026-07-30T13:10:33.5322768Z",
+        "dead_lettered_at": "2026-07-31T09:19:44.9103036Z",
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5278713Z",
-        "id": "53b8b2cef8cd903339795fb267668288",
+        "enqueued_at": "2026-07-31T09:19:44.9058186Z",
+        "id": "d96f494e7dc8d4503ed89aa55151700f",
         "max_attempts": 5,
         "payload": "POISON: malformed payload #0",
         "payload_bytes": 28,
@@ -106,10 +106,10 @@ MCP CALL: jobq_peek
       {
         "attempt": 0,
         "attempts": 0,
-        "dead_lettered_at": "2026-07-30T13:10:33.5356514Z",
+        "dead_lettered_at": "2026-07-31T09:19:44.9131318Z",
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5328343Z",
-        "id": "d4918a97b221bc0b4075ec1e9283f280",
+        "enqueued_at": "2026-07-31T09:19:44.9108653Z",
+        "id": "bcf68c634dab5a1e7a71bca2077415aa",
         "max_attempts": 5,
         "payload": "POISON: malformed payload #1",
         "payload_bytes": 28,
@@ -118,10 +118,10 @@ MCP CALL: jobq_peek
       {
         "attempt": 0,
         "attempts": 0,
-        "dead_lettered_at": "2026-07-30T13:10:33.5378348Z",
+        "dead_lettered_at": "2026-07-31T09:19:44.9154063Z",
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5356514Z",
-        "id": "ce1c7834e0b87753b02e0fa44e98ffc7",
+        "enqueued_at": "2026-07-31T09:19:44.9131318Z",
+        "id": "73c77ca1f8b1eabcce870b4fdec69b39",
         "max_attempts": 5,
         "payload": "POISON: malformed payload #2",
         "payload_bytes": 28,
@@ -130,10 +130,10 @@ MCP CALL: jobq_peek
       {
         "attempt": 0,
         "attempts": 0,
-        "dead_lettered_at": "2026-07-30T13:10:33.5405891Z",
+        "dead_lettered_at": "2026-07-31T09:19:44.9182218Z",
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5383893Z",
-        "id": "de095a09c3e18d208057c48ac70c4824",
+        "enqueued_at": "2026-07-31T09:19:44.915976Z",
+        "id": "71bfe8ca3172feb58b551522d34761cd",
         "max_attempts": 5,
         "payload": "POISON: malformed payload #3",
         "payload_bytes": 28,
@@ -142,10 +142,10 @@ MCP CALL: jobq_peek
       {
         "attempt": 0,
         "attempts": 0,
-        "dead_lettered_at": "2026-07-30T13:10:33.5433749Z",
+        "dead_lettered_at": "2026-07-31T09:19:44.9204035Z",
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5411494Z",
-        "id": "26484e3fb03eb2be94bb4107ca491913",
+        "enqueued_at": "2026-07-31T09:19:44.9187736Z",
+        "id": "6fa49df0a91415fa639fe2ab1cbfe61a",
         "max_attempts": 5,
         "payload": "POISON: malformed payload #4",
         "payload_bytes": 28,
@@ -154,10 +154,10 @@ MCP CALL: jobq_peek
       {
         "attempt": 0,
         "attempts": 0,
-        "dead_lettered_at": "2026-07-30T13:10:33.5462108Z",
+        "dead_lettered_at": "2026-07-31T09:19:44.9214879Z",
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5433749Z",
-        "id": "c29b56cf4b99f68bcd79c834b184a17e",
+        "enqueued_at": "2026-07-31T09:19:44.9204035Z",
+        "id": "1fe4c91b7e05b481d19394020c614cb8",
         "max_attempts": 5,
         "payload": "POISON: malformed payload #5",
         "payload_bytes": 28,
@@ -167,8 +167,8 @@ MCP CALL: jobq_peek
         "attempt": 0,
         "attempts": 0,
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5473493Z",
-        "id": "07965ab2778776b1a7c5b69228277dea",
+        "enqueued_at": "2026-07-31T09:19:44.9220354Z",
+        "id": "278e15bf32d7df1b70ac6635873fa50a",
         "max_attempts": 5,
         "payload": "send welcome email #0",
         "payload_bytes": 21,
@@ -178,8 +178,8 @@ MCP CALL: jobq_peek
         "attempt": 0,
         "attempts": 0,
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5489794Z",
-        "id": "30f960a8d9e4e21a8aac8faed22baa36",
+        "enqueued_at": "2026-07-31T09:19:44.9231066Z",
+        "id": "7b02d49ae2b9ee1fac04307ca273f8b5",
         "max_attempts": 5,
         "payload": "send welcome email #1",
         "payload_bytes": 21,
@@ -189,8 +189,8 @@ MCP CALL: jobq_peek
         "attempt": 0,
         "attempts": 0,
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5506191Z",
-        "id": "1875783dbbe3705ca3d3c0c7c66d6eb3",
+        "enqueued_at": "2026-07-31T09:19:44.9248255Z",
+        "id": "e4b2f1c0d27a544240c4e209ae1edbdd",
         "max_attempts": 5,
         "payload": "send welcome email #2",
         "payload_bytes": 21,
@@ -200,8 +200,8 @@ MCP CALL: jobq_peek
         "attempt": 0,
         "attempts": 0,
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5523299Z",
-        "id": "92bf2c9b272880870cd485df9f3ed03f",
+        "enqueued_at": "2026-07-31T09:19:44.9258924Z",
+        "id": "d98d49aee642f08f370af7af0fec9046",
         "max_attempts": 5,
         "payload": "send welcome email #3",
         "payload_bytes": 21,
@@ -211,8 +211,8 @@ MCP CALL: jobq_peek
         "attempt": 0,
         "attempts": 0,
         "dead_lettered_attempts": 1,
-        "enqueued_at": "2026-07-30T13:10:33.5540254Z",
-        "id": "39c3621c9d430914f5d94ebe1b6dedfe",
+        "enqueued_at": "2026-07-31T09:19:44.9269866Z",
+        "id": "21360b2c25355046c689ae5b1ca15afb",
         "max_attempts": 5,
         "payload": "send welcome email #4",
         "payload_bytes": 21,
@@ -230,58 +230,68 @@ AGENT partitions the DLQ by dead_lettered_at:
     crash victims, not poison — safe to requeue.
 
 MCP CALL: jobq_dlq_requeue
-  args:   {"job_ids":["07965ab2778776b1a7c5b69228277dea","30f960a8d9e4e21a8aac8faed22baa36","1875783dbbe3705ca3d3c0c7c66d6eb3","92bf2c9b272880870cd485df9f3ed03f","39c3621c9d430914f5d94ebe1b6dedfe"],"topic":"emails"}
+  args:   {"job_ids":["278e15bf32d7df1b70ac6635873fa50a","7b02d49ae2b9ee1fac04307ca273f8b5","e4b2f1c0d27a544240c4e209ae1edbdd","d98d49aee642f08f370af7af0fec9046","21360b2c25355046c689ae5b1ca15afb"],"topic":"emails"}
   result: {
-    "remaining_in_dlq": 7,
+    "limit_reached": false,
+    "not_found": [],
+    "not_reached": [],
+    "remaining_in_dlq": 6,
     "requeued": [
       {
-        "dlq_job_id": "07965ab2778776b1a7c5b69228277dea",
-        "new_job_id": "83c45083cd3cc6e1437d93901da043fd",
+        "dlq_job_id": "278e15bf32d7df1b70ac6635873fa50a",
+        "new_job_id": "6ecd153abb43528ab88c393e1969a89a",
         "payload_bytes": 21
       },
       {
-        "dlq_job_id": "30f960a8d9e4e21a8aac8faed22baa36",
-        "new_job_id": "31dc3ec40fcae0a53fca80050c01ee80",
+        "dlq_job_id": "7b02d49ae2b9ee1fac04307ca273f8b5",
+        "new_job_id": "cc0c4798e2a81e235dfecf6af72e4d0a",
         "payload_bytes": 21
       },
       {
-        "dlq_job_id": "1875783dbbe3705ca3d3c0c7c66d6eb3",
-        "new_job_id": "c96799f8d677b5c3ff15da1fd8234960",
+        "dlq_job_id": "e4b2f1c0d27a544240c4e209ae1edbdd",
+        "new_job_id": "14b8e2724e28f622c0434604763ab87c",
         "payload_bytes": 21
       },
       {
-        "dlq_job_id": "92bf2c9b272880870cd485df9f3ed03f",
-        "new_job_id": "f45840af7d6b31141619f6f473592781",
+        "dlq_job_id": "d98d49aee642f08f370af7af0fec9046",
+        "new_job_id": "cf177bbaf38da17336de1d7223b5c9af",
+        "payload_bytes": 21
+      },
+      {
+        "dlq_job_id": "21360b2c25355046c689ae5b1ca15afb",
+        "new_job_id": "d62b1bf66a8edf18e61d85a0e8e435f9",
         "payload_bytes": 21
       }
     ],
     "skipped": [
       {
-        "dlq_job_id": "53b8b2cef8cd903339795fb267668288",
-        "reason": "not in job_ids"
+        "dlq_job_id": "d96f494e7dc8d4503ed89aa55151700f",
+        "reason": "not in job_ids; passed over to reach a named job — this call held its lease and returned it via nack (one attempt spent)"
       },
       {
-        "dlq_job_id": "d4918a97b221bc0b4075ec1e9283f280",
-        "reason": "not in job_ids"
+        "dlq_job_id": "bcf68c634dab5a1e7a71bca2077415aa",
+        "reason": "not in job_ids; passed over to reach a named job — this call held its lease and returned it via nack (one attempt spent)"
       },
       {
-        "dlq_job_id": "ce1c7834e0b87753b02e0fa44e98ffc7",
-        "reason": "not in job_ids"
+        "dlq_job_id": "73c77ca1f8b1eabcce870b4fdec69b39",
+        "reason": "not in job_ids; passed over to reach a named job — this call held its lease and returned it via nack (one attempt spent)"
       },
       {
-        "dlq_job_id": "de095a09c3e18d208057c48ac70c4824",
-        "reason": "not in job_ids"
+        "dlq_job_id": "71bfe8ca3172feb58b551522d34761cd",
+        "reason": "not in job_ids; passed over to reach a named job — this call held its lease and returned it via nack (one attempt spent)"
       },
       {
-        "dlq_job_id": "26484e3fb03eb2be94bb4107ca491913",
-        "reason": "not in job_ids"
+        "dlq_job_id": "6fa49df0a91415fa639fe2ab1cbfe61a",
+        "reason": "not in job_ids; passed over to reach a named job — this call held its lease and returned it via nack (one attempt spent)"
       },
       {
-        "dlq_job_id": "c29b56cf4b99f68bcd79c834b184a17e",
-        "reason": "not in job_ids"
+        "dlq_job_id": "1fe4c91b7e05b481d19394020c614cb8",
+        "reason": "not in job_ids; passed over to reach a named job — this call held its lease and returned it via nack (one attempt spent)"
       }
     ]
   }
+
+AGENT verifies the accounting: requeued=5, skipped=6, not_reached=0, not_found=0 — every crash victim and every poison job accounted for, nothing silently stranded.
 
 
 >>> lease-expiry verification: does redelivery still work post-recovery?
@@ -292,17 +302,17 @@ MCP CALL: jobq_dequeue
     "job": {
       "attempt": 1,
       "attempts": 1,
-      "enqueued_at": "2026-07-30T14:10:34.3759206+01:00",
-      "id": "5165949b45ed46a5380944f0ec31e7c0",
+      "enqueued_at": "2026-07-31T10:19:45.7427693+01:00",
+      "id": "ebb1aaa688e8cf461bf75e24dafc64f9",
       "max_attempts": 5,
       "payload": "verify redelivery",
       "payload_bytes": 17,
       "topic": "lease-check"
     },
     "lease": {
-      "deadline": "2026-07-30T14:10:35.8775016+01:00",
-      "id": "e570b4e95e766cd43c0f2175a69ba7b6",
-      "job_id": "5165949b45ed46a5380944f0ec31e7c0",
+      "deadline": "2026-07-31T10:19:47.2443813+01:00",
+      "id": "dce6d3cbcc8b047e78d3637a4ed3070e",
+      "job_id": "ebb1aaa688e8cf461bf75e24dafc64f9",
       "topic": "lease-check"
     }
   }
@@ -330,17 +340,17 @@ MCP CALL: jobq_dequeue
     "job": {
       "attempt": 2,
       "attempts": 2,
-      "enqueued_at": "2026-07-30T14:10:34.3759206+01:00",
-      "id": "5165949b45ed46a5380944f0ec31e7c0",
+      "enqueued_at": "2026-07-31T10:19:45.7427693+01:00",
+      "id": "ebb1aaa688e8cf461bf75e24dafc64f9",
       "max_attempts": 5,
       "payload": "verify redelivery",
       "payload_bytes": 17,
       "topic": "lease-check"
     },
     "lease": {
-      "deadline": "2026-07-30T14:11:06.1811289+01:00",
-      "id": "05c76f8560df734c45d1881f8c7c0fbf",
-      "job_id": "5165949b45ed46a5380944f0ec31e7c0",
+      "deadline": "2026-07-31T10:20:17.5475233+01:00",
+      "id": "ae9c212405a3ec0b22a6fdf5a4ce0fee",
+      "job_id": "ebb1aaa688e8cf461bf75e24dafc64f9",
       "topic": "lease-check"
     }
   }
@@ -355,17 +365,17 @@ MCP CALL: jobq_topic_stats
         "acked": 0,
         "dead_letters": 0,
         "dropped": 0,
-        "enqueued": 14,
+        "enqueued": 15,
         "in_flight": 0,
-        "ready": 14
+        "ready": 15
       },
       "emails.dlq": {
-        "acked": 4,
+        "acked": 5,
         "dead_letters": 0,
         "dropped": 0,
         "enqueued": 11,
         "in_flight": 0,
-        "ready": 7
+        "ready": 6
       },
       "lease-check": {
         "acked": 1,
@@ -378,5 +388,5 @@ MCP CALL: jobq_topic_stats
     }
   }
 
-AGENT: sum over every topic — enqueued=26, acked+ready+in_flight+dead_letters+dropped=26 (5+21+0+0+0)
+AGENT: sum over every topic — enqueued=27, acked+ready+in_flight+dead_letters+dropped=27 (6+21+0+0+0)
 AGENT: conservation holds. Every job that entered the queue is accounted for in exactly one place.

@@ -56,6 +56,15 @@ off as an agent capability, and — because `jobq_peek` is read-only — the
 agent can look as many times as it wants while deciding, without spending
 any of those jobs' attempt budget to do it.
 
+When the agent then calls `jobq_dlq_requeue` naming only the 5 crash
+victims, the 6 real poison jobs sitting ahead of them in the DLQ are never
+at risk: selection is planned from a read-only `jobq_peek` snapshot first,
+so each poison job is passed over **at most once** (reported in `skipped`,
+one attempt spent, never destroyed, never touched twice) rather than being
+repeatedly nacked to make room for the named jobs behind it. The program
+asserts this for real (`verifyRequeueResult`): exactly 5 requeued, exactly
+6 skipped, nothing left in `not_reached` or `not_found`.
+
 ## A caveat worth knowing before you read the transcript
 
 `Stats.Enqueued` is **not** a cumulative, all-time counter that survives a

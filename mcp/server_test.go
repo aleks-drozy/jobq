@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"testing"
 
@@ -494,6 +495,376 @@ func TestDLQRequeueOrdering(t *testing.T) {
 	stats := q.Stats("order-src")
 	if stats.Ready != 1 {
 		t.Fatalf("source topic Ready = %d, want 1 — the pre-fault enqueue must survive the ack failure", stats.Ready)
+	}
+}
+
+// --- dlq_requeue job_ids safety regressions --------------------------------
+
+// deadLetterOne enqueues payload to topic with max_attempts=1, dequeues and
+// nacks it so it lands in <topic>.dlq for real (Attempts reset to 0,
+// MaxAttempts reset to jobq.DefaultMaxAttempts by the engine's adopt path —
+// see topic.go), and returns its (unchanged) job ID.
+func deadLetterOne(t *testing.T, cs *sdk.ClientSession, topic, payload string) string {
+	t.Helper()
+	if _, ok, errDTO := callTool[enqueueOut](t, cs, "jobq_enqueue", map[string]any{
+		"topic": topic, "payload": payload, "max_attempts": 1,
+	}); !ok {
+		t.Fatalf("enqueue failed: %+v", errDTO)
+	}
+	deq, ok, errDTO := callTool[dequeueOut](t, cs, "jobq_dequeue", map[string]any{"topic": topic})
+	if !ok || deq.Job == nil {
+		t.Fatalf("dequeue failed: %+v", errDTO)
+	}
+	if _, ok, errDTO := callTool[nackOut](t, cs, "jobq_nack", map[string]any{
+		"topic": topic, "lease_id": deq.Lease.ID,
+	}); !ok {
+		t.Fatalf("nack failed: %+v", errDTO)
+	}
+	return deq.Job.ID
+}
+
+// TestDLQRequeueNeverDestroysNonTargets is the exact audit repro from the
+// implementation plan: a 3-job DLQ, job_ids naming the middle job. The old
+// nack-to-skip design would alternate the two non-targets through repeated
+// dequeue/nack cycles across the call's whole `limit` budget, eventually
+// dropping one of them. The peek-gated design must pass over each
+// non-target at most once.
+func TestDLQRequeueNeverDestroysNonTargets(t *testing.T) {
+	for _, v := range []struct {
+		name string
+		make func(t *testing.T) Backend
+	}{
+		{"local", newLocalBackendForTest},
+		{"http", newHTTPBackendForTest},
+	} {
+		t.Run(v.name, func(t *testing.T) {
+			cs := newTestSession(t, v.make(t), ServerOptions{})
+			topic := "audit-repro"
+			dlqTopic := topic + ".dlq"
+
+			idA := deadLetterOne(t, cs, topic, "A")
+			idB := deadLetterOne(t, cs, topic, "B")
+			idC := deadLetterOne(t, cs, topic, "C")
+
+			rq, ok, errDTO := callTool[dlqRequeueOut](t, cs, "jobq_dlq_requeue", map[string]any{
+				"topic": topic, "job_ids": []string{idB},
+			})
+			if !ok {
+				t.Fatalf("dlq_requeue failed: %+v", errDTO)
+			}
+			if len(rq.Requeued) != 1 || rq.Requeued[0].DLQJobID != idB {
+				t.Fatalf("requeued = %+v, want exactly [%s]", rq.Requeued, idB)
+			}
+			if len(rq.Skipped) != 1 || rq.Skipped[0].DLQJobID != idA || rq.Skipped[0].Reason != reasonPassedOver {
+				t.Fatalf("skipped = %+v, want exactly [{%s %q}]", rq.Skipped, idA, reasonPassedOver)
+			}
+			if len(rq.NotFound) != 0 {
+				t.Fatalf("not_found = %v, want empty", rq.NotFound)
+			}
+			if len(rq.NotReached) != 0 {
+				t.Fatalf("not_reached = %v, want empty", rq.NotReached)
+			}
+			if rq.RemainingInDLQ != 2 {
+				t.Fatalf("remaining_in_dlq = %d, want 2", rq.RemainingInDLQ)
+			}
+
+			pk, ok, errDTO := callTool[peekOut](t, cs, "jobq_peek", map[string]any{"topic": dlqTopic, "limit": 10})
+			if !ok {
+				t.Fatalf("peek failed: %+v", errDTO)
+			}
+			byID := map[string]jobOut{}
+			for _, j := range pk.Ready {
+				byID[j.ID] = j
+			}
+			if j, present := byID[idC]; !present || j.Attempts != 0 {
+				t.Fatalf("C = %+v (present=%v), want present with Attempts=0", j, present)
+			}
+			if j, present := byID[idA]; !present || j.Attempts != 1 {
+				t.Fatalf("A = %+v (present=%v), want present with Attempts=1", j, present)
+			}
+
+			stats, ok, errDTO := callTool[topicStatsOut](t, cs, "jobq_topic_stats", map[string]any{"topic": dlqTopic})
+			if !ok {
+				t.Fatalf("topic_stats failed: %+v", errDTO)
+			}
+			if stats.Topics[dlqTopic].Dropped != 0 {
+				t.Fatalf("Dropped = %+v, want 0", stats.Topics[dlqTopic])
+			}
+		})
+	}
+}
+
+// TestDLQRequeueRefusesToDestroyBlocker builds a DLQ job already one nack
+// away from destruction (Attempts=4 of MaxAttempts=5) sitting ahead of a
+// named target, and proves the tool leaves it completely untouched instead
+// of scanning past it — and that this holds identically on a repeated call
+// (monotone safety: the blocker never erodes further).
+func TestDLQRequeueRefusesToDestroyBlocker(t *testing.T) {
+	for _, v := range []struct {
+		name string
+		make func(t *testing.T) Backend
+	}{
+		{"local", newLocalBackendForTest},
+		{"http", newHTTPBackendForTest},
+	} {
+		t.Run(v.name, func(t *testing.T) {
+			cs := newTestSession(t, v.make(t), ServerOptions{})
+			topic := "blocker-repro"
+			dlqTopic := topic + ".dlq"
+
+			idA := deadLetterOne(t, cs, topic, "A")
+			// Bump A to Attempts=4 (one shy of its DLQ MaxAttempts=5) via
+			// four dequeue-from-DLQ + nack cycles, before B ever arrives —
+			// A is the only job in the DLQ during this, so it's the one
+			// redelivered each time.
+			for i := 0; i < 4; i++ {
+				deq, ok, errDTO := callTool[dequeueOut](t, cs, "jobq_dequeue", map[string]any{"topic": dlqTopic})
+				if !ok || deq.Job == nil || deq.Job.ID != idA {
+					t.Fatalf("bump %d: dequeue failed or wrong job: ok=%v err=%+v job=%+v", i, ok, errDTO, deq.Job)
+				}
+				if _, ok, errDTO := callTool[nackOut](t, cs, "jobq_nack", map[string]any{
+					"topic": dlqTopic, "lease_id": deq.Lease.ID,
+				}); !ok {
+					t.Fatalf("bump %d: nack failed: %+v", i, errDTO)
+				}
+			}
+			idB := deadLetterOne(t, cs, topic, "B")
+
+			for call := 0; call < 2; call++ {
+				rq, ok, errDTO := callTool[dlqRequeueOut](t, cs, "jobq_dlq_requeue", map[string]any{
+					"topic": topic, "job_ids": []string{idB},
+				})
+				if !ok {
+					t.Fatalf("call %d: dlq_requeue failed: %+v", call, errDTO)
+				}
+				if len(rq.Requeued) != 0 {
+					t.Fatalf("call %d: requeued = %+v, want empty", call, rq.Requeued)
+				}
+				if len(rq.Skipped) != 1 || rq.Skipped[0].DLQJobID != idA || rq.Skipped[0].Reason != reasonWouldDestroy {
+					t.Fatalf("call %d: skipped = %+v, want exactly [{%s %q}]", call, rq.Skipped, idA, reasonWouldDestroy)
+				}
+				wantReason := reasonBlockedBy(idA)
+				if len(rq.NotReached) != 1 || rq.NotReached[0].JobID != idB || rq.NotReached[0].Reason != wantReason {
+					t.Fatalf("call %d: not_reached = %+v, want exactly [{%s %q}]", call, rq.NotReached, idB, wantReason)
+				}
+
+				stats, ok, errDTO := callTool[topicStatsOut](t, cs, "jobq_topic_stats", map[string]any{"topic": dlqTopic})
+				if !ok {
+					t.Fatalf("call %d: topic_stats failed: %+v", call, errDTO)
+				}
+				if stats.Topics[dlqTopic].Dropped != 0 {
+					t.Fatalf("call %d: Dropped = %+v, want 0", call, stats.Topics[dlqTopic])
+				}
+
+				pk, ok, errDTO := callTool[peekOut](t, cs, "jobq_peek", map[string]any{"topic": dlqTopic, "limit": 10})
+				if !ok {
+					t.Fatalf("call %d: peek failed: %+v", call, errDTO)
+				}
+				byID := map[string]jobOut{}
+				for _, j := range pk.Ready {
+					byID[j.ID] = j
+				}
+				if j, present := byID[idA]; !present || j.Attempts != 4 {
+					t.Fatalf("call %d: A = %+v (present=%v), want present with Attempts=4 — no erosion across calls", call, j, present)
+				}
+				if _, present := byID[idB]; !present {
+					t.Fatalf("call %d: B missing from DLQ", call)
+				}
+			}
+		})
+	}
+}
+
+// TestDLQRequeueAccountsForEveryNamedID proves the silent-abandonment fix:
+// with a limit smaller than the number of named targets plus a bogus ID,
+// every requested ID must land in exactly one of requeued/not_found/
+// not_reached — the old design could report neither for an ID past the
+// scan's iteration budget.
+func TestDLQRequeueAccountsForEveryNamedID(t *testing.T) {
+	for _, v := range []struct {
+		name string
+		make func(t *testing.T) Backend
+	}{
+		{"local", newLocalBackendForTest},
+		{"http", newHTTPBackendForTest},
+	} {
+		t.Run(v.name, func(t *testing.T) {
+			cs := newTestSession(t, v.make(t), ServerOptions{})
+			topic := "limit-accounting"
+
+			var ids []string
+			for i := 0; i < 5; i++ {
+				ids = append(ids, deadLetterOne(t, cs, topic, fmt.Sprintf("job-%d", i)))
+			}
+			const bogus = "does-not-exist"
+			jobIDs := append(append([]string{}, ids...), bogus)
+
+			rq, ok, errDTO := callTool[dlqRequeueOut](t, cs, "jobq_dlq_requeue", map[string]any{
+				"topic": topic, "job_ids": jobIDs, "limit": 2,
+			})
+			if !ok {
+				t.Fatalf("dlq_requeue failed: %+v", errDTO)
+			}
+			if len(rq.Requeued) != 2 {
+				t.Fatalf("requeued = %+v, want 2 entries", rq.Requeued)
+			}
+			if !rq.LimitReached {
+				t.Fatal("limit_reached = false, want true")
+			}
+			if len(rq.NotReached) != 3 {
+				t.Fatalf("not_reached = %+v, want 3 entries", rq.NotReached)
+			}
+			for _, nr := range rq.NotReached {
+				if nr.Reason != reasonLimitReached {
+					t.Fatalf("not_reached reason = %q, want %q", nr.Reason, reasonLimitReached)
+				}
+			}
+			if len(rq.NotFound) != 1 || rq.NotFound[0] != bogus {
+				t.Fatalf("not_found = %v, want [%s]", rq.NotFound, bogus)
+			}
+
+			buckets := map[string]int{}
+			for _, r := range rq.Requeued {
+				buckets[r.DLQJobID]++
+			}
+			for _, s := range rq.Skipped {
+				buckets[s.DLQJobID]++
+			}
+			for _, id := range rq.NotFound {
+				buckets[id]++
+			}
+			for _, nr := range rq.NotReached {
+				buckets[nr.JobID]++
+			}
+			for _, id := range jobIDs {
+				if buckets[id] != 1 {
+					t.Fatalf("job_id %s appears in %d buckets (want exactly 1); full partition: %v", id, buckets[id], buckets)
+				}
+			}
+		})
+	}
+}
+
+// TestDLQRequeueTranscriptScenario reproduces the committed demo transcript
+// shape that motivated this fix: 6 poison (non-target) jobs ahead of 5
+// crash-victim (target) jobs. The buggy tool requeued 4/5 and silently
+// stranded the 5th. The fix must requeue all 5, report each of the 6
+// non-targets exactly once (never twice — never dropped), and leave nothing
+// in not_reached.
+func TestDLQRequeueTranscriptScenario(t *testing.T) {
+	for _, v := range []struct {
+		name string
+		make func(t *testing.T) Backend
+	}{
+		{"local", newLocalBackendForTest},
+		{"http", newHTTPBackendForTest},
+	} {
+		t.Run(v.name, func(t *testing.T) {
+			cs := newTestSession(t, v.make(t), ServerOptions{})
+			topic := "transcript-repro"
+			dlqTopic := topic + ".dlq"
+
+			var poisonIDs []string
+			for i := 0; i < 6; i++ {
+				poisonIDs = append(poisonIDs, deadLetterOne(t, cs, topic, fmt.Sprintf("poison-%d", i)))
+			}
+			var targetIDs []string
+			for i := 0; i < 5; i++ {
+				targetIDs = append(targetIDs, deadLetterOne(t, cs, topic, fmt.Sprintf("target-%d", i)))
+			}
+
+			rq, ok, errDTO := callTool[dlqRequeueOut](t, cs, "jobq_dlq_requeue", map[string]any{
+				"topic": topic, "job_ids": targetIDs,
+			})
+			if !ok {
+				t.Fatalf("dlq_requeue failed: %+v", errDTO)
+			}
+			if len(rq.Requeued) != 5 {
+				t.Fatalf("requeued = %d, want 5: %+v", len(rq.Requeued), rq.Requeued)
+			}
+			if len(rq.Skipped) != 6 {
+				t.Fatalf("skipped = %d, want 6: %+v", len(rq.Skipped), rq.Skipped)
+			}
+			if len(rq.NotReached) != 0 {
+				t.Fatalf("not_reached = %+v, want empty", rq.NotReached)
+			}
+			if len(rq.NotFound) != 0 {
+				t.Fatalf("not_found = %+v, want empty", rq.NotFound)
+			}
+
+			stats, ok, errDTO := callTool[topicStatsOut](t, cs, "jobq_topic_stats", map[string]any{"topic": dlqTopic})
+			if !ok {
+				t.Fatalf("topic_stats failed: %+v", errDTO)
+			}
+			if stats.Topics[dlqTopic].Dropped != 0 {
+				t.Fatalf("Dropped = %+v, want 0", stats.Topics[dlqTopic])
+			}
+
+			pk, ok, errDTO := callTool[peekOut](t, cs, "jobq_peek", map[string]any{"topic": dlqTopic, "limit": 20})
+			if !ok {
+				t.Fatalf("peek failed: %+v", errDTO)
+			}
+			byID := map[string]jobOut{}
+			for _, j := range pk.Ready {
+				byID[j.ID] = j
+			}
+			for _, id := range poisonIDs {
+				j, present := byID[id]
+				if !present {
+					t.Fatalf("poison job %s missing from DLQ", id)
+				}
+				if j.Attempts != 1 {
+					t.Fatalf("poison job %s attempts = %d, want exactly 1 (passed over once, never twice)", id, j.Attempts)
+				}
+			}
+		})
+	}
+}
+
+// TestDLQRequeueHeldLeaseSurvivesFault injects an Ack fault mid-run (the
+// same faultyAck wrapper TestDLQRequeueOrdering uses) while a safe
+// non-target's lease is being held, and proves the deferred nack still
+// returns it to the DLQ rather than leaking it in flight or dropping it.
+func TestDLQRequeueHeldLeaseSurvivesFault(t *testing.T) {
+	q := jobq.New()
+	defer q.Close()
+	base := NewInMemoryBackend(q)
+	fb := &faultyAck{Backend: base, failAckAfter: 1}
+	cs := newTestSession(t, fb, ServerOptions{})
+
+	topic := "fault-repro"
+	dlqTopic := topic + ".dlq"
+
+	idA := deadLetterOne(t, cs, topic, "A")
+	idB := deadLetterOne(t, cs, topic, "B")
+
+	_, ok, errDTO := callTool[dlqRequeueOut](t, cs, "jobq_dlq_requeue", map[string]any{
+		"topic": topic, "job_ids": []string{idB},
+	})
+	if ok {
+		t.Fatal("dlq_requeue succeeded despite the injected ack fault")
+	}
+	if errDTO.Code != "fault_injected" {
+		t.Fatalf("code = %q, want fault_injected", errDTO.Code)
+	}
+
+	stats := q.Stats(dlqTopic)
+	if stats.Dropped != 0 {
+		t.Fatalf("Dropped = %d, want 0", stats.Dropped)
+	}
+
+	ready, _, err := q.Peek(dlqTopic, 10, false)
+	if err != nil {
+		t.Fatalf("Peek: %v", err)
+	}
+	found := false
+	for _, j := range ready {
+		if j.ID == idA {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("A (the held non-target) not back in the DLQ ready list: %+v", ready)
 	}
 }
 

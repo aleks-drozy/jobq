@@ -338,6 +338,9 @@ func agentTrajectory(cs *sdk.ClientSession) error {
 		return err
 	}
 	printCall("jobq_dlq_requeue", map[string]any{"topic": "emails", "job_ids": crashVictims}, requeue)
+	if err := verifyRequeueResult(requeue, len(crashVictims), len(realFailures)); err != nil {
+		return err
+	}
 	fmt.Println()
 
 	step("lease-expiry verification: does redelivery still work post-recovery?")
@@ -387,6 +390,35 @@ func agentTrajectory(cs *sdk.ClientSession) error {
 	}
 	printCall("jobq_topic_stats", nil, final)
 	return printReconciliation(final)
+}
+
+// verifyRequeueResult hard-asserts the jobq_dlq_requeue accounting, the same
+// discipline printReconciliation applies to the closing stats: this program
+// fails for real if the peek-gated job_ids selection regresses, rather than
+// just printing numbers on faith. wantRequeued is every crash victim;
+// wantSkipped is every real poison job (each passed over exactly once,
+// never dropped, never silently stranded).
+func verifyRequeueResult(requeue map[string]any, wantRequeued, wantSkipped int) error {
+	requeued, _ := requeue["requeued"].([]any)
+	skipped, _ := requeue["skipped"].([]any)
+	notReached, _ := requeue["not_reached"].([]any)
+	notFound, _ := requeue["not_found"].([]any)
+	if len(requeued) != wantRequeued {
+		return fmt.Errorf("DEMO ASSERTION FAILED: requeued = %d, want %d", len(requeued), wantRequeued)
+	}
+	if len(skipped) != wantSkipped {
+		return fmt.Errorf("DEMO ASSERTION FAILED: skipped = %d, want %d", len(skipped), wantSkipped)
+	}
+	if len(notReached) != 0 {
+		return fmt.Errorf("DEMO ASSERTION FAILED: not_reached = %v, want empty", notReached)
+	}
+	if len(notFound) != 0 {
+		return fmt.Errorf("DEMO ASSERTION FAILED: not_found = %v, want empty", notFound)
+	}
+	fmt.Printf("AGENT verifies the accounting: requeued=%d, skipped=%d, not_reached=%d, not_found=%d — "+
+		"every crash victim and every poison job accounted for, nothing silently stranded.\n\n",
+		len(requeued), len(skipped), len(notReached), len(notFound))
+	return nil
 }
 
 func printReconciliation(stats map[string]any) error {

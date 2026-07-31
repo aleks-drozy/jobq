@@ -383,12 +383,43 @@ func (ts *toolset) topicStats(_ context.Context, _ *sdk.CallToolRequest, in topi
 const (
 	defaultRequeueLimit = 10
 	maxRequeueLimit     = 50
+	// requeueScanWindow bounds the read-only jobq_peek snapshot the job_ids
+	// path plans from. 100 is already exercised against both backends by
+	// jobq_peek's own maxPeekLimit.
+	requeueScanWindow = 100
 )
+
+// Reason strings for the job_ids path's skipped/not_reached buckets. Kept as
+// constants so tests can assert them exactly.
+const (
+	// reasonPassedOver marks a non-target job that was safely dequeued (it
+	// had at least one attempt to spare) and held for the duration of this
+	// call, then returned via a deferred Nack once the plan finished.
+	reasonPassedOver = "not in job_ids; passed over to reach a named job — this call held its lease and returned it via nack (one attempt spent)"
+	// reasonWouldDestroy marks a non-target that was never dequeued at all
+	// because doing so would have put it on its final attempt, and any
+	// subsequent nack or lease expiry would then destroy it.
+	reasonWouldDestroy = "passing over would consume this job's final attempt and destroy it; left untouched"
+	// reasonLimitReached is the not_reached reason when limit (which counts
+	// only requeues, not pass-overs) was exhausted before every named ID was
+	// reached.
+	reasonLimitReached = "limit_reached"
+	// reasonConcurrent is the not_reached reason when the DLQ changed
+	// between the planning peek and execution, invalidating the rest of the
+	// plan.
+	reasonConcurrent = "dlq changed concurrently"
+)
+
+// reasonBlockedBy is the not_reached reason for named IDs sitting behind a
+// blocker job that was left untouched (see reasonWouldDestroy).
+func reasonBlockedBy(blockerID string) string {
+	return fmt.Sprintf("blocked by %s: passing it over would destroy it", blockerID)
+}
 
 type dlqRequeueIn struct {
 	Topic       string   `json:"topic" jsonschema:"Source topic, e.g. \"emails\" — the .dlq suffix is added. Passing \"emails.dlq\" also works."`
-	Limit       *int     `json:"limit,omitempty" jsonschema:"Max dead-lettered jobs examined from the head of the DLQ, 1-50. Default 10."`
-	JobIDs      []string `json:"job_ids,omitempty" jsonschema:"Requeue only these dead-lettered job IDs (from jobq_peek). Omit to take the first N (see limit) in FIFO order."`
+	Limit       *int     `json:"limit,omitempty" jsonschema:"Max jobs requeued, 1-50 (default 10). When job_ids is set, this counts requeues only — jobs passed over to reach a named job_id no longer count against it, and a job whose pass-over would destroy it is never dequeued at all."`
+	JobIDs      []string `json:"job_ids,omitempty" jsonschema:"Requeue only these dead-lettered job IDs (from jobq_peek). Selection is planned from a read-only jobq_peek snapshot first, so it never risks the jobs it scans past; every ID ends up in exactly one of requeued/not_found/not_reached in the response. Omit job_ids to take the first N (see limit) in FIFO order instead."`
 	MaxAttempts *int     `json:"max_attempts,omitempty" jsonschema:"Attempt budget for the requeued copy. Default 5."`
 }
 
@@ -403,10 +434,36 @@ type skippedItem struct {
 	Reason   string `json:"reason"`
 }
 
+// notReachedItem is a named job_ids entry that was present in the scanned
+// window but never processed this call — the plan stopped before reaching
+// it. See the reason constants above for why.
+type notReachedItem struct {
+	JobID  string `json:"job_id"`
+	Reason string `json:"reason"`
+}
+
 type dlqRequeueOut struct {
-	Requeued       []requeuedItem `json:"requeued"`
-	Skipped        []skippedItem  `json:"skipped"`
-	RemainingInDLQ int            `json:"remaining_in_dlq"`
+	Requeued []requeuedItem `json:"requeued"`
+	// Rescued holds jobs that landed on their final attempt only because a
+	// concurrent DLQ change defeated the planning-time safety check — the
+	// only alternative disposition the engine offers at that point is
+	// destruction, so these are requeued instead and reported separately
+	// from an ordinary requeue.
+	Rescued        []requeuedItem   `json:"rescued,omitempty"`
+	Skipped        []skippedItem    `json:"skipped"`
+	NotFound       []string         `json:"not_found"`
+	NotReached     []notReachedItem `json:"not_reached"`
+	LimitReached   bool             `json:"limit_reached"`
+	RemainingInDLQ int              `json:"remaining_in_dlq"`
+}
+
+// fillRemaining reads remaining_in_dlq for out. Best-effort: a stats read
+// that fails leaves the zero value rather than failing the whole call, since
+// the requeue/rescue/skip work is already done by the time this runs.
+func (ts *toolset) fillRemaining(out *dlqRequeueOut, dlqTopic string) {
+	if stats, err := ts.be.TopicStats(dlqTopic); err == nil {
+		out.RemainingInDLQ = stats.Ready
+	}
 }
 
 // dlqRequeue is the one compound tool: per job it does
@@ -418,11 +475,18 @@ type dlqRequeueOut struct {
 // the engine), so DeadLetteredAttempts history does not follow it — which
 // is why both IDs come back.
 //
-// Scanning past a job.job_ids doesn't want costs that job one attempt (a
-// nack, to return it to the DLQ): the engine has no dequeue-by-ID, so
-// "skip this one" can only mean "take it off the head and put it back."
-// Keep job_ids close to the front of the DLQ (from a recent jobq_peek) to
-// minimize this.
+// Without job_ids, every dequeued job is a target (dlqRequeueFIFO): the
+// first `limit` in FIFO order, never nacked, so that path was already safe
+// and is unchanged here.
+//
+// With job_ids, selection is planned from a read-only jobq_peek snapshot
+// (dlqRequeueByIDs) before anything is touched: a non-target whose pass-over
+// would put it on its final attempt is never dequeued at all, so it can
+// never be destroyed by this call. A safe non-target is dequeued at most
+// once, its lease held (not nacked) until every planned step has run, then
+// released — one attempt spent, reported, and provably survivable since it
+// was pre-checked to have budget left. Every requested ID lands in exactly
+// one of requeued/not_found/not_reached, so nothing is silently stranded.
 func (ts *toolset) dlqRequeue(_ context.Context, _ *sdk.CallToolRequest, in dlqRequeueIn) (*sdk.CallToolResult, dlqRequeueOut, error) {
 	dlqTopic := in.Topic
 	if !strings.HasSuffix(dlqTopic, jobq.DeadLetterSuffix) {
@@ -438,20 +502,22 @@ func (ts *toolset) dlqRequeue(_ context.Context, _ *sdk.CallToolRequest, in dlqR
 		limit = maxRequeueLimit
 	}
 
-	var wantIDs map[string]bool
-	if len(in.JobIDs) > 0 {
-		wantIDs = make(map[string]bool, len(in.JobIDs))
-		for _, id := range in.JobIDs {
-			wantIDs[id] = true
-		}
-	}
-
 	var enqOpts []jobq.EnqueueOption
 	if in.MaxAttempts != nil && *in.MaxAttempts > 0 {
 		enqOpts = append(enqOpts, jobq.WithMaxAttempts(*in.MaxAttempts))
 	}
 
-	out := dlqRequeueOut{Requeued: []requeuedItem{}, Skipped: []skippedItem{}}
+	if len(in.JobIDs) == 0 {
+		return ts.dlqRequeueFIFO(dlqTopic, srcTopic, limit, enqOpts)
+	}
+	return ts.dlqRequeueByIDs(dlqTopic, srcTopic, limit, in.JobIDs, enqOpts)
+}
+
+// dlqRequeueFIFO is the job_ids-omitted path: take the first `limit` dead
+// letters in FIFO order. It never nacks, so it never risks destroying
+// anything it touches.
+func (ts *toolset) dlqRequeueFIFO(dlqTopic, srcTopic string, limit int, enqOpts []jobq.EnqueueOption) (*sdk.CallToolResult, dlqRequeueOut, error) {
+	out := dlqRequeueOut{Requeued: []requeuedItem{}, Skipped: []skippedItem{}, NotFound: []string{}, NotReached: []notReachedItem{}}
 	for i := 0; i < limit; i++ {
 		job, lease, err := ts.be.Dequeue(dlqTopic, 30*time.Second)
 		if err != nil {
@@ -460,15 +526,6 @@ func (ts *toolset) dlqRequeue(_ context.Context, _ *sdk.CallToolRequest, in dlqR
 			}
 			return nil, dlqRequeueOut{}, mapError(err)
 		}
-
-		if wantIDs != nil && !wantIDs[job.ID] {
-			if err := ts.be.Nack(lease); err != nil {
-				return nil, dlqRequeueOut{}, mapError(err)
-			}
-			out.Skipped = append(out.Skipped, skippedItem{DLQJobID: job.ID, Reason: "not in job_ids"})
-			continue
-		}
-
 		newID, err := ts.be.Enqueue(srcTopic, job.Payload, enqOpts...)
 		if err != nil {
 			return nil, dlqRequeueOut{}, mapError(err)
@@ -478,10 +535,222 @@ func (ts *toolset) dlqRequeue(_ context.Context, _ *sdk.CallToolRequest, in dlqR
 		}
 		out.Requeued = append(out.Requeued, requeuedItem{DLQJobID: job.ID, NewJobID: newID, PayloadBytes: len(job.Payload)})
 	}
+	ts.fillRemaining(&out, dlqTopic)
+	return nil, out, nil
+}
 
-	if stats, err := ts.be.TopicStats(dlqTopic); err == nil {
-		out.RemainingInDLQ = stats.Ready
+// dlqRequeueByIDs is the job_ids path. See the dlqRequeue doc comment and
+// the reason constants above for the safety argument; in short:
+//
+//  1. Peek a read-only snapshot of the DLQ head (requeueScanWindow jobs).
+//  2. Plan, in head order, stopping at the first of: every named ID found
+//     in the window handled; the limit (requeues only) reached; or a
+//     non-target whose pass-over would consume its final attempt — that
+//     job is never dequeued, and everything behind it in the window is
+//     reported not_reached.
+//  3. Execute the plan: targets get dequeue -> enqueue-to-source -> ack;
+//     safe non-targets get dequeued and their lease HELD (not nacked) so
+//     they cannot be re-encountered within this call. If the dequeued job's
+//     ID doesn't match the plan (a concurrent DLQ change), the stale
+//     snapshot is abandoned: a matching target is requeued, a non-target
+//     already on its final attempt is rescued (requeue, since destruction
+//     is the only other disposition), otherwise it's held+skipped like any
+//     safe non-target — and every remaining named ID is reported
+//     not_reached with reasonConcurrent.
+//  4. Finally (even on error paths), nack every held lease. Each was
+//     pre-checked to have attempts to spare, so this provably cannot
+//     destroy it.
+func (ts *toolset) dlqRequeueByIDs(dlqTopic, srcTopic string, limit int, jobIDs []string, enqOpts []jobq.EnqueueOption) (res *sdk.CallToolResult, out dlqRequeueOut, callErr error) {
+	out = dlqRequeueOut{Requeued: []requeuedItem{}, Skipped: []skippedItem{}, NotFound: []string{}, NotReached: []notReachedItem{}}
+
+	wantIDs := make(map[string]bool, len(jobIDs))
+	wantOrder := make([]string, 0, len(jobIDs))
+	for _, id := range jobIDs {
+		if !wantIDs[id] {
+			wantIDs[id] = true
+			wantOrder = append(wantOrder, id)
+		}
 	}
+
+	ready, _, _, err := ts.be.Peek(dlqTopic, requeueScanWindow, false)
+	if err != nil {
+		return nil, dlqRequeueOut{}, mapError(err)
+	}
+
+	foundIdx := make(map[string]int, len(wantIDs))
+	lastNeededIdx := -1
+	for i, j := range ready {
+		if wantIDs[j.ID] {
+			foundIdx[j.ID] = i
+			lastNeededIdx = i
+		}
+	}
+	for _, id := range wantOrder {
+		if _, ok := foundIdx[id]; !ok {
+			out.NotFound = append(out.NotFound, id)
+		}
+	}
+	if lastNeededIdx == -1 {
+		// None of the named IDs are in the scanned window at all — nothing
+		// to plan, nothing to touch.
+		ts.fillRemaining(&out, dlqTopic)
+		return nil, out, nil
+	}
+
+	type plannedStep struct {
+		job    *jobq.Job
+		target bool
+	}
+	var plan []plannedStep
+	handled := make(map[string]bool, len(foundIdx))
+	requeuesPlanned := 0
+	limitHit := false
+	blockerID := ""
+
+planLoop:
+	for i := 0; i <= lastNeededIdx; i++ {
+		j := ready[i]
+		if requeuesPlanned >= limit {
+			limitHit = true
+			break planLoop
+		}
+		if wantIDs[j.ID] {
+			plan = append(plan, plannedStep{job: j, target: true})
+			requeuesPlanned++
+			handled[j.ID] = true
+			continue
+		}
+		if j.Attempts+1 >= j.MaxAttempts {
+			// Dequeuing this job would put it on its final attempt; any
+			// subsequent nack or lease expiry then destroys it. Leave it
+			// untouched (never dequeued) and stop the scan here.
+			blockerID = j.ID
+			out.Skipped = append(out.Skipped, skippedItem{DLQJobID: j.ID, Reason: reasonWouldDestroy})
+			break planLoop
+		}
+		plan = append(plan, plannedStep{job: j, target: false})
+	}
+
+	var stopReason string
+	switch {
+	case blockerID != "":
+		stopReason = reasonBlockedBy(blockerID)
+	case limitHit:
+		stopReason = reasonLimitReached
+		out.LimitReached = true
+	}
+	if stopReason != "" {
+		for _, id := range wantOrder {
+			if _, ok := foundIdx[id]; ok && !handled[id] {
+				out.NotReached = append(out.NotReached, notReachedItem{JobID: id, Reason: stopReason})
+			}
+		}
+	}
+
+	// heldLeases are safe non-targets already dequeued but not yet nacked —
+	// held so they can't be re-encountered within this call, then returned
+	// once the plan finishes (or faults), by the deferred loop below. Every
+	// entry was pre-checked (Attempts+1 < MaxAttempts at plan time, or an
+	// equivalent live check on the race path), so nacking it here provably
+	// cannot destroy it.
+	//
+	// remaining_in_dlq is filled in here too, not at the normal-path return
+	// site: TopicStats must be read AFTER every held lease is released,
+	// never before, or it undercounts jobs this call is about to hand back.
+	var heldLeases []jobq.Lease
+	defer func() {
+		for _, l := range heldLeases {
+			_ = ts.be.Nack(l)
+		}
+		if callErr == nil {
+			ts.fillRemaining(&out, dlqTopic)
+		}
+	}()
+
+	raceStopped := false
+execLoop:
+	for _, st := range plan {
+		job, lease, derr := ts.be.Dequeue(dlqTopic, 30*time.Second)
+		if derr != nil {
+			if errors.Is(derr, jobq.ErrNoJob) {
+				raceStopped = true
+				break execLoop
+			}
+			return nil, dlqRequeueOut{}, mapError(derr)
+		}
+
+		if job.ID != st.job.ID {
+			// Concurrent DLQ activity invalidated the snapshot this plan was
+			// built from. Handle whatever actually came off the head, then
+			// stop consulting the stale plan.
+			switch {
+			case wantIDs[job.ID] && !handled[job.ID]:
+				newID, eerr := ts.be.Enqueue(srcTopic, job.Payload, enqOpts...)
+				if eerr != nil {
+					return nil, dlqRequeueOut{}, mapError(eerr)
+				}
+				if aerr := ts.be.Ack(lease); aerr != nil {
+					return nil, dlqRequeueOut{}, mapError(aerr)
+				}
+				out.Requeued = append(out.Requeued, requeuedItem{DLQJobID: job.ID, NewJobID: newID, PayloadBytes: len(job.Payload)})
+				handled[job.ID] = true
+			case job.Attempts >= job.MaxAttempts:
+				// The peek-time safety gate was defeated by the race: this
+				// job is now on its final attempt. Destruction is the only
+				// other disposition the engine offers, so rescue it instead.
+				newID, eerr := ts.be.Enqueue(srcTopic, job.Payload, enqOpts...)
+				if eerr != nil {
+					return nil, dlqRequeueOut{}, mapError(eerr)
+				}
+				if aerr := ts.be.Ack(lease); aerr != nil {
+					return nil, dlqRequeueOut{}, mapError(aerr)
+				}
+				out.Rescued = append(out.Rescued, requeuedItem{DLQJobID: job.ID, NewJobID: newID, PayloadBytes: len(job.Payload)})
+			default:
+				heldLeases = append(heldLeases, lease)
+				out.Skipped = append(out.Skipped, skippedItem{DLQJobID: job.ID, Reason: reasonPassedOver})
+			}
+			raceStopped = true
+			break execLoop
+		}
+
+		if st.target {
+			newID, eerr := ts.be.Enqueue(srcTopic, job.Payload, enqOpts...)
+			if eerr != nil {
+				// Leave the lease to expire rather than nack it here: the
+				// job is on the attempt it was dequeued on, and nack vs.
+				// expiry both route through the same retire() — no change
+				// in outcome, only in timing.
+				return nil, dlqRequeueOut{}, mapError(eerr)
+			}
+			if aerr := ts.be.Ack(lease); aerr != nil {
+				return nil, dlqRequeueOut{}, mapError(aerr)
+			}
+			out.Requeued = append(out.Requeued, requeuedItem{DLQJobID: job.ID, NewJobID: newID, PayloadBytes: len(job.Payload)})
+		} else {
+			heldLeases = append(heldLeases, lease)
+			out.Skipped = append(out.Skipped, skippedItem{DLQJobID: job.ID, Reason: reasonPassedOver})
+		}
+	}
+
+	if raceStopped {
+		for _, id := range wantOrder {
+			if _, ok := foundIdx[id]; !ok || handled[id] {
+				continue
+			}
+			already := false
+			for _, nr := range out.NotReached {
+				if nr.JobID == id {
+					already = true
+					break
+				}
+			}
+			if !already {
+				out.NotReached = append(out.NotReached, notReachedItem{JobID: id, Reason: reasonConcurrent})
+			}
+		}
+	}
+
 	return nil, out, nil
 }
 

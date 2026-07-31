@@ -116,7 +116,7 @@ Eleven tools. Five are read-only (`readOnlyHint: true`, registered under
 | `jobq_peek` | **yes** | no lease, no attempt consumed, no log write — the only safe way to inspect a `.dlq` |
 | `jobq_list_topics` | **yes** | split into ordinary topics and their `.dlq` counterparts |
 | `jobq_topic_stats` | **yes** | omit `topic` for every topic; unknown topic reports zeroes |
-| `jobq_dlq_requeue` | no | compound: dequeue→enqueue→ack, in that order — see below |
+| `jobq_dlq_requeue` | no | compound: dequeue→enqueue→ack, in that order; peek-gated `job_ids` selection — see below |
 | `jobq_health` | **yes** | status, durability, uptime, mode |
 | `jobq_recovery_report` | **yes** | the process-start `RecoveryReport`, plus a plain-English interpretation |
 
@@ -142,10 +142,42 @@ which jobq's at-least-once contract permits. Ack-first would risk losing
 the job outright instead. The requeued job is a **new job with a new ID**
 (the engine has no move primitive), so `DeadLetteredAttempts` history does
 not follow it — which is why the tool returns both the old and new IDs.
-Scanning past a job not named in `job_ids` costs that job one attempt (a
-nack, to put it back) — the engine has no dequeue-by-ID, so "skip this one"
-can only mean "take it off the head and put it back." Keep `job_ids` close
-to the front of the DLQ (from a recent `jobq_peek`) to minimize that.
+
+**Selecting specific jobs via `job_ids` is peek-gated, not nack-and-hope.**
+The obvious fix — "just don't nack a job on its last attempt" — doesn't
+work: by the time a nack could be refused, `Dequeue` has already consumed
+the attempt, and the only ways off a lease are ack (deletes), nack (drops
+the job if exhausted), or expiry (same drop, later). So the tool never gets
+that far for a job it would destroy: it first takes a read-only `jobq_peek`
+snapshot of the DLQ head and plans the whole call before touching anything.
+
+- A non-target one nack away from destruction (`Attempts+1 >= MaxAttempts`)
+  is **never dequeued** — left untouched, reported in `skipped` with an
+  explicit reason, and it blocks whatever `job_ids` named behind it
+  (reported in `not_reached`). Calling again with the same state produces
+  the identical result — the blocker never erodes, no matter how many times
+  a scan is asked to pass over it.
+- A safe non-target is dequeued **at most once** per call; its lease is
+  held (not nacked) until the whole plan finishes, then released — one
+  attempt spent, reported in `skipped`.
+- If the DLQ changes between the peek and execution, the stale plan is
+  abandoned: a job the race put on its final attempt is *rescued* (requeued
+  instead of nacked — destruction is the only other option at that point)
+  and reported separately in `rescued`.
+- Every ID in `job_ids` ends up in exactly one of `requeued`, `not_found`
+  (never in the scanned window), or `not_reached` (seen, but not processed
+  this call — reason `limit_reached`, blocked by another job, or a
+  concurrent DLQ change). Nothing is silently stranded.
+
+What this can't remove: a blocker still blocks anything named behind it in
+the same call (name the blocker itself to clear it), and a target dequeued
+on its final attempt whose source-`Enqueue` then fails is still destroyed
+on lease expiry — inherent to enqueue-before-ack, not specific to
+`job_ids`. Both need a dequeue-by-ID engine primitive to fully close, which
+is out of scope for now (see "Deliberately absent" below). The regression
+guards are `server_test.go`'s `TestDLQRequeueNeverDestroysNonTargets`,
+`TestDLQRequeueRefusesToDestroyBlocker`, `TestDLQRequeueAccountsForEveryNamedID`,
+and `TestDLQRequeueTranscriptScenario`.
 
 ### Payload encoding
 
@@ -199,6 +231,10 @@ build, the same discipline `jobqhttp/roundtrip_test.go` established for the
 HTTP layer in P3. `TestAttemptBurnRegression` is the guard for `jobq_peek`'s
 entire reason for existing (see above); `TestDLQRequeueOrdering` fault-injects
 a failure between enqueue and ack to prove duplicate-not-loss.
+`TestDLQRequeueNeverDestroysNonTargets`, `TestDLQRequeueRefusesToDestroyBlocker`,
+`TestDLQRequeueAccountsForEveryNamedID`, `TestDLQRequeueTranscriptScenario`,
+and `TestDLQRequeueHeldLeaseSurvivesFault` guard the peek-gated `job_ids`
+selection described above.
 
 ## Demo
 

@@ -154,8 +154,15 @@ func NewServer(be Backend, opts ServerOptions) *sdk.Server {
 		Description: "Move jobs out of a dead-letter queue back onto their source topic, as new jobs with " +
 			"new IDs (there is no in-place move). Internally: dequeue-from-DLQ, then enqueue-to-source, then " +
 			"ack-the-DLQ-lease, in that order — never ack-first, so a fault between the two risks a duplicate, " +
-			"never a loss. Pass job_ids (from jobq_peek) to requeue specific jobs; omit it to take the first " +
-			"`limit` in FIFO order. Poison jobs can be left in the DLQ for a human by omitting their IDs.",
+			"never a loss. Omit job_ids to take the first `limit` in FIFO order (safe: never nacks anything). " +
+			"Pass job_ids (from jobq_peek) to requeue specific jobs: selection is planned from a read-only " +
+			"jobq_peek snapshot first, so a job whose pass-over would consume its final attempt is never " +
+			"dequeued at all — it is left untouched and blocks the scan behind it, reported in `skipped`/" +
+			"`not_reached` rather than destroyed. A safe job passed over to reach a named one costs it at most " +
+			"one attempt per call, reported in `skipped`. Every requested ID lands in exactly one of " +
+			"`requeued`, `not_found` (absent from the scanned window), or `not_reached` (present but not " +
+			"processed this call, with a reason) — nothing is silently stranded. Poison jobs can be left in " +
+			"the DLQ for a human by omitting their IDs.",
 	}, ts.dlqRequeue)
 
 	return s
