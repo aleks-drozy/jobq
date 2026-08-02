@@ -3,16 +3,16 @@
 A durable job queue written from scratch in Go, standard library only.
 
 At-least-once delivery, leases (visibility timeouts), automatic retries with
-per-job attempt budgets, delayed jobs, and dead-letter queues — built to be
+per-job attempt budgets, delayed jobs, and dead-letter queues, built to be
 explained, not just to run. The design decisions, the failure modes, and the
 costs of each are documented rather than assumed.
 
-**Status: P3.5 complete — HTTP + CLI + MCP.** A segmented, CRC-checked
+**Status: P3.5 complete (HTTP + CLI + MCP).** A segmented, CRC-checked
 write-ahead log with group commit, deterministic replay, and a crash
 harness that kills the process cold and proves nothing acknowledged is
-lost — plus an HTTP surface (`cmd/jobqd`), a CLI (`cmd/jobq`) that runs
+lost, plus an HTTP surface (`cmd/jobqd`), a CLI (`cmd/jobq`) that runs
 jobs for real, retries them, and dead-letters them live in a terminal, and
-an MCP server (`mcp/`, own module, own dependencies — see below) that lets
+an MCP server (`mcp/`, own module, own dependencies, see below) that lets
 an agent enqueue, inspect, and recover a queue through eleven typed tools.
 See `mcp/README.md` and `mcp/demo/` for a real crash, a real recovery, and
 a real MCP client diagnosing it. P4 is the full design deep-dive.
@@ -48,7 +48,7 @@ go build -o jobq.exe  ./cmd/jobq
 ./jobq.exe dequeue --wait 5s emails
 ./jobq.exe stats emails
 
-# curl works too — the enqueue body is the raw payload when
+# curl works too. The enqueue body is the raw payload when
 # Content-Type isn't application/json:
 curl -X POST http://127.0.0.1:8080/v1/topics/emails/jobs -d 'hello'
 ```
@@ -67,7 +67,7 @@ land in `emails.dlq`.
 
 The payload arrives on the worker's stdin; `JOBQ_JOB_ID`, `JOBQ_TOPIC`,
 `JOBQ_ATTEMPT`, and `JOBQ_MAX_ATTEMPTS` arrive in its environment. Exit 0
-acks, non-zero nacks — a SIGINT while a job is running nacks it too,
+acks, non-zero nacks; a SIGINT while a job is running nacks it too,
 instead of abandoning it to lease expiry.
 
 There is no authentication (see "Not in v1" below), which is why `jobqd`
@@ -77,7 +77,7 @@ binds `127.0.0.1` by default rather than `0.0.0.0`.
 
 **Actor per topic, not a global mutex.** Each topic owns its state in a
 single goroutine; callers communicate over channels. Unrelated topics never
-contend, and "expire this lease exactly once" is not a race — it is just
+contend, and "expire this lease exactly once" is not a race: it is just
 another message in the same serialized stream.
 
 **Lease expiry is evaluated lazily, not by a timer.** Before any read of
@@ -94,7 +94,7 @@ and make retries idempotent.
 **Dead-letter queues are ordinary topics.** `emails.dlq` is consumed with the
 same API as `emails`. A job entering the DLQ gets a fresh attempt budget so it
 can be drained and retried, and its failure history is preserved in
-`DeadLetteredAttempts` — a field nothing resets, because evidence that is
+`DeadLetteredAttempts`, a field nothing resets, because evidence that is
 overwritten by normal use is not evidence.
 
 **Time is injectable.** Every time-dependent behaviour reads a clock
@@ -109,12 +109,12 @@ at-least-once permits.
 
 **Payloads are stored unencrypted.** The WAL directory and its segment/lock
 files are created with restrictive permissions (`0700`/`0600`, owner-only),
-but job payload bytes themselves are written to disk in plain text — there
+but job payload bytes themselves are written to disk in plain text. There
 is no at-rest encryption. Do not enqueue secrets or other sensitive data
 without encrypting them yourself before calling `Enqueue`.
 
 **Restarts expire every lease.** Leases are not persisted: a job in flight
-at crash time returns to ready with its attempt count intact — or
+at crash time returns to ready with its attempt count intact, or
 dead-letters, if the crash consumed its last attempt. Recovery introduces no
 semantics a consumer hasn't already seen from an ordinary timeout, and the
 inference is deterministic, so it is never re-logged.
@@ -124,7 +124,7 @@ encoded records to a single committer goroutine; while one batch is inside
 `fsync`, everything arriving accumulates into the next. Frames are
 CRC-checked with the checksum covering the length prefix; segment headers
 are synced at creation because Windows cannot fsync a directory, so file
-contents — never file names — are the source of truth. A torn tail is
+contents (never file names) are the source of truth. A torn tail is
 truncated, counted, and reported; corruption before the tail refuses to
 guess.
 
@@ -160,22 +160,22 @@ Beyond per-behaviour table tests, two properties are checked directly:
 
 - **Conservation.** Under thousands of randomized, seeded interleavings of
   enqueue/dequeue/ack/nack/expiry across multiple topics, every job that
-  entered the queue is accounted for in exactly one place — ready, in flight,
+  entered the queue is accounted for in exactly one place: ready, in flight,
   acked, or dead-lettered. Leaks and double-counts are silent in ordinary
   use; this is what catches them.
 - **Unique settlement, honest overlap.** The queue never hands a job to a
-  second consumer without an intervening lease expiry or nack — but once a
+  second consumer without an intervening lease expiry or nack, but once a
   lease expires, at-least-once means the previous holder may still be
   working while the redelivery is in someone else's hands. That overlap is
   the contract, not a bug (`Job.ID` and `Job.Attempts` exist so consumers
   can be idempotent), and what IS guaranteed is pinned under the race
-  detector: for each job, exactly one lease's Ack ever succeeds — every
+  detector: for each job, exactly one lease's Ack ever succeeds; every
   superseded lease is rejected at settle time. The test asserts it actually
   witnessed an overlap, so it cannot silently stop testing the scenario.
 
 P3 adds the same discipline over HTTP: `roundtrip_test.go` runs one
-behaviour suite twice — once against `*jobq.Queue`, once against
-`*jobqhttp.Client` over a live server — so sentinel errors, attempt
+behaviour suite twice (once against `*jobq.Queue`, once against
+`*jobqhttp.Client` over a live server) so sentinel errors, attempt
 counting, and DLQ routing can't quietly diverge between the two;
 `conservation_test.go` reruns the conservation property with concurrent
 HTTP workers under `-race`; `restart_test.go` ties the HTTP surface to P2's
@@ -186,11 +186,11 @@ durability guarantee directly.
 `mcp/` is an MCP server over this queue, built on the official
 `github.com/modelcontextprotocol/go-sdk`. It is a **separate Go module**
 (`github.com/aleks-drozy/jobq/mcp`, with its own `go.mod`) specifically so
-this root module's "standard library only" claim stays true — `go list -m all`
+this root module's "standard library only" claim stays true: `go list -m all`
 here prints exactly `github.com/aleks-drozy/jobq`, and CI checks that, not
 just this sentence. See `mcp/README.md` for the eleven tools, and
 `docs/specs/2026-07-31-jobq-p3.5-mcp.md` for why MCP was deferred in P3 and
-isn't anymore, why it needed one new engine primitive (`Queue.Peek` — a
+isn't anymore, why it needed one new engine primitive (`Queue.Peek`, a
 read-only inspection path, because `Dequeue` is the only other one and it
 mutates), and the crash-recovery-diagnosis demo in `mcp/demo/`.
 
