@@ -27,9 +27,17 @@ type topic struct {
 	// blocks on it: gated waiters are forwarded to the caller's reply
 	// channel by a helper goroutine, so fsync latency stalls the caller
 	// (as durability demands) but never the actor loop.
-	logRec    func(walRecord, bool) waiter
-	walID     uint32
-	initial   []*Job // restored jobs, already justified by the log
+	logRec  func(walRecord, bool) waiter
+	walID   uint32
+	initial []*Job // restored jobs, already justified by the log
+	// newID mints job and lease IDs. Random by default; a replicated queue
+	// replaces it so every replica mints the same IDs from the same log.
+	newID func() string
+	// passive stops Stats and Peek from observing lease expiry. A
+	// replicated state machine sets it: a read that moved an expired job
+	// back to ready on one replica and not another would reorder that
+	// replica's ready list and the replicas would diverge.
+	passive   bool
 	reqs      chan request
 	done      chan struct{}
 	closeOnce sync.Once
@@ -43,16 +51,28 @@ type topicConfig struct {
 	logRec     func(walRecord, bool) waiter
 	walID      uint32
 	initial    []*Job
+	newID      func() string
+	passive    bool
 }
 
 // request is one operation for the actor loop. Exactly one field is set.
 type request struct {
-	enqueue *enqueueReq
-	adopt   *adoptReq
-	dequeue *dequeueReq
-	settle  *settleReq
-	peek    *peekReq
-	stats   chan Stats
+	enqueue   *enqueueReq
+	adopt     *adoptReq
+	dequeue   *dequeueReq
+	settle    *settleReq
+	peek      *peekReq
+	pending   *pendingReq
+	expireAll chan struct{}
+	stats     chan Stats
+}
+
+// pendingReq asks whether a Dequeue made at time at would find work: a
+// visible ready job, or a lease whose deadline has passed. It reads and
+// never mutates, whatever the clock says.
+type pendingReq struct {
+	at    time.Time
+	reply chan bool
 }
 
 // adoptReq hands an existing job to this topic without resetting its
@@ -137,8 +157,13 @@ func newTopic(cfg topicConfig) *topic {
 		logRec:     cfg.logRec,
 		walID:      cfg.walID,
 		initial:    cfg.initial,
+		newID:      cfg.newID,
+		passive:    cfg.passive,
 		reqs:       make(chan request),
 		done:       make(chan struct{}),
+	}
+	if t.newID == nil {
+		t.newID = newID
 	}
 	go t.run()
 	return t
@@ -209,7 +234,7 @@ func (t *topic) run() {
 				r := req.enqueue
 				now := t.now()
 				job := &Job{
-					ID:    newID(),
+					ID:    t.newID(),
 					Topic: t.name,
 					// Copied: a producer reusing its buffer after Enqueue
 					// must not be able to mutate what gets delivered.
@@ -267,7 +292,7 @@ func (t *topic) run() {
 				job.Attempt = job.Attempts
 				fl := &inflight{
 					job:      job,
-					leaseID:  newID(),
+					leaseID:  t.newID(),
 					deadline: t.now().Add(r.visibility),
 				}
 				leases[fl.leaseID] = fl
@@ -332,7 +357,9 @@ func (t *topic) run() {
 
 			case req.peek != nil:
 				r := req.peek
-				expire() // same discipline as stats: settle expiry before reading
+				if !t.passive {
+					expire() // same discipline as stats: settle expiry before reading
+				}
 				limit := r.limit
 				n := len(ready)
 				truncated := false
@@ -363,8 +390,30 @@ func (t *topic) run() {
 				}
 				r.reply <- peekResp{ready: readyOut, inflight: inflightOut, truncated: truncated}
 
+			case req.pending != nil:
+				at := req.pending.at
+				has := deadline.Len() > 0 && !(*deadline)[0].deadline.After(at)
+				for i := 0; !has && i < len(ready); i++ {
+					has = !ready[i].NotBefore.After(at)
+				}
+				req.pending.reply <- has
+
+			case req.expireAll != nil:
+				// Every lease ends now, whatever its deadline. Heap order
+				// is total (deadline, then lease ID), so every replica
+				// returns the jobs to ready in the same order.
+				for deadline.Len() > 0 {
+					next := heap.Pop(deadline).(*inflight)
+					delete(leases, next.leaseID)
+					stats.InFlight--
+					t.retire(next.job, &ready, &stats)
+				}
+				close(req.expireAll)
+
 			case req.stats != nil:
-				expire()
+				if !t.passive {
+					expire()
+				}
 				snapshot := stats
 				snapshot.Ready = len(ready)
 				req.stats <- snapshot
@@ -461,6 +510,24 @@ func (t *topic) peek(limit int, includeInflight bool) ([]*Job, []*Job, bool, err
 	return resp.ready, resp.inflight, resp.truncated, nil
 }
 
+// pending is read-only; see pendingReq.
+func (t *topic) pending(at time.Time) bool {
+	reply := make(chan bool, 1)
+	if err := t.send(request{pending: &pendingReq{at: at, reply: reply}}); err != nil {
+		return false
+	}
+	return <-reply
+}
+
+// expireAll ends every outstanding lease, as a restart does.
+func (t *topic) expireAll() {
+	done := make(chan struct{})
+	if err := t.send(request{expireAll: done}); err != nil {
+		return
+	}
+	<-done
+}
+
 func (t *topic) stats() Stats {
 	reply := make(chan Stats, 1)
 	if err := t.send(request{stats: reply}); err != nil {
@@ -487,10 +554,19 @@ func (t *topic) close() {
 // expiry checks cost O(1) to peek instead of scanning every lease.
 type deadlineHeap []*inflight
 
-func (h deadlineHeap) Len() int           { return len(h) }
-func (h deadlineHeap) Less(i, j int) bool { return h[i].deadline.Before(h[j].deadline) }
-func (h deadlineHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
-func (h *deadlineHeap) Push(x any)        { fl := x.(*inflight); fl.index = len(*h); *h = append(*h, fl) }
+func (h deadlineHeap) Len() int { return len(h) }
+
+// Less breaks deadline ties on the lease ID so the order is total. Two
+// leases issued at the same clock reading then expire in the same order on
+// every replica, whatever shape each replica's heap happens to be in.
+func (h deadlineHeap) Less(i, j int) bool {
+	if !h[i].deadline.Equal(h[j].deadline) {
+		return h[i].deadline.Before(h[j].deadline)
+	}
+	return h[i].leaseID < h[j].leaseID
+}
+func (h deadlineHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
+func (h *deadlineHeap) Push(x any)   { fl := x.(*inflight); fl.index = len(*h); *h = append(*h, fl) }
 func (h *deadlineHeap) Pop() any {
 	old := *h
 	n := len(old)

@@ -19,6 +19,8 @@ jobs:
       - run: go test -race -count=1 ./...
       - name: raft simulation, 10000 seeds
         run: go test -count=1 -run 'TestSimulation$' ./raft -raft.sims=10000
+      - name: cluster crash harness, 5 more runs
+        run: go test -count=5 -run 'TestClusterLosesNothing' ./cmd/jobqd
       - name: standard library only
         run: |
           deps="$(go list -m all | tail -n +2)"

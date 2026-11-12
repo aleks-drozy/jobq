@@ -1,5 +1,6 @@
 // Command jobqd is the jobq HTTP daemon: it wraps a *jobq.Queue in
-// jobqhttp.NewHandler and serves it.
+// jobqhttp.NewHandler and serves it. With -peers it runs instead as one
+// node of a replicated cluster (see cluster.go); the client API is the same.
 //
 // There is no authentication (see README, "Not in v1"), so the default
 // bind address is 127.0.0.1 — binding 0.0.0.0 by default would put an
@@ -17,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -44,6 +46,15 @@ type config struct {
 	maxPayload      int64
 	maxWait         time.Duration
 	shutdownTimeout time.Duration
+
+	// Cluster mode, selected by a non-empty peers.
+	breakLock bool
+
+	id        uint64
+	peers     string
+	advertise string
+	peerAddr  string
+	tick      time.Duration
 }
 
 func parseFlags(args []string) (config, error) {
@@ -56,8 +67,19 @@ func parseFlags(args []string) (config, error) {
 	fs.Int64Var(&c.maxPayload, "max-payload", 1<<20, "max enqueue body size in bytes")
 	fs.DurationVar(&c.maxWait, "max-wait", 30*time.Second, "hard cap on a dequeue's wait_ms")
 	fs.DurationVar(&c.shutdownTimeout, "shutdown-timeout", 10*time.Second, "grace period for in-flight requests on shutdown")
+	fs.BoolVar(&c.breakLock, "break-lock", false, "remove a lock file left in -dir by a crashed process before opening it; only safe when something else (a container runtime, a service manager) guarantees one jobqd per directory")
+	fs.Uint64Var(&c.id, "id", 0, "cluster mode: this node's ID, a positive number listed in -peers")
+	fs.StringVar(&c.peers, "peers", "", "cluster mode: every node's peer URL, e.g. 1=http://10.0.0.1:9090,2=http://10.0.0.2:9090,3=http://10.0.0.3:9090")
+	fs.StringVar(&c.advertise, "advertise", "", "cluster mode: every node's client URL in the same form, so a follower can tell a client where the leader is")
+	fs.StringVar(&c.peerAddr, "peer-addr", "127.0.0.1:9090", "cluster mode: listen address for other nodes (no auth: must not be reachable by anyone else)")
+	fs.DurationVar(&c.tick, "tick", 10*time.Millisecond, "cluster mode: Raft tick; elections fire after 15 to 30 ticks of silence, heartbeats every 3")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
+	}
+	if c.peers != "" {
+		if _, err := parseClusterFlags(c); err != nil {
+			return config{}, err
+		}
 	}
 	if _, err := parseSyncPolicy(c.sync); c.dir != "" && err != nil {
 		return config{}, err
@@ -71,6 +93,12 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	logger := log.New(stdout, "jobqd: ", log.LstdFlags)
+	if err := breakStaleLock(c, logger); err != nil {
+		return err
+	}
+	if c.peers != "" {
+		return runCluster(ctx, c, logger)
+	}
 
 	q, handlerOpts, err := openQueue(c, logger)
 	if err != nil {
@@ -86,6 +114,27 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 
 	h := jobqhttp.NewHandler(q, handlerOpts...)
 	return serve(ctx, ln, h, c.shutdownTimeout, logger)
+}
+
+// breakStaleLock implements -break-lock. A jobqd that is killed leaves its
+// lock file behind, and the next start refuses the directory because it
+// cannot tell a crashed owner from a live one. Under a supervisor that
+// already guarantees a single instance, that refusal only turns one crash
+// into a permanent outage, so the operator may opt out of it.
+func breakStaleLock(c config, logger *log.Logger) error {
+	if !c.breakLock || c.dir == "" {
+		return nil
+	}
+	path := filepath.Join(c.dir, "jobq.lock")
+	err := os.Remove(path)
+	if err == nil {
+		logger.Printf("-break-lock: removed %s left by a previous process", path)
+		return nil
+	}
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return fmt.Errorf("-break-lock: %w", err)
 }
 
 func openQueue(c config, logger *log.Logger) (*jobq.Queue, []jobqhttp.HandlerOption, error) {

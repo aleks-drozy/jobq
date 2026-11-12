@@ -1,0 +1,3 @@
+# Keep LF in the working tree on every platform: gofmt rejects CRLF.
+* text=auto eol=lf
+*.seg binary

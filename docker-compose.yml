@@ -1,0 +1,52 @@
+# A three-node jobq cluster on one machine.
+#
+#   docker compose up --build
+#   jobq --addr http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 enqueue --payload hi work
+#   docker compose kill node1        # kill a node, the leader if you like
+#   docker compose up -d node1       # and bring it back
+#
+# There is no authentication anywhere in jobq. The client ports are
+# published on this machine's loopback only, and the peer ports are not
+# published at all: they are reachable only on the compose network.
+#
+# Inside a container jobqd binds 0.0.0.0, which is safe only because of the
+# two lines above. -advertise is what a follower tells a client when asked
+# where the leader is, so it holds the addresses as seen from the host.
+#
+# -break-lock: a killed jobqd leaves its lock file in the volume. Compose
+# runs one container per volume, so removing it on start is safe here.
+
+x-jobqd: &jobqd
+  build: .
+  restart: "no"
+  stop_grace_period: 15s
+
+x-cluster-flags:
+  - &addr "-addr=0.0.0.0:8080"
+  - &peer "-peer-addr=0.0.0.0:9090"
+  - &dir "-dir=/data"
+  - &lock "-break-lock"
+  - &peers "-peers=1=http://node1:9090,2=http://node2:9090,3=http://node3:9090"
+  - &advertise "-advertise=1=http://127.0.0.1:8081,2=http://127.0.0.1:8082,3=http://127.0.0.1:8083"
+
+services:
+  node1:
+    <<: *jobqd
+    command: ["-id=1", *addr, *peer, *dir, *lock, *peers, *advertise]
+    ports: ["127.0.0.1:8081:8080"]
+    volumes: ["node1:/data"]
+  node2:
+    <<: *jobqd
+    command: ["-id=2", *addr, *peer, *dir, *lock, *peers, *advertise]
+    ports: ["127.0.0.1:8082:8080"]
+    volumes: ["node2:/data"]
+  node3:
+    <<: *jobqd
+    command: ["-id=3", *addr, *peer, *dir, *lock, *peers, *advertise]
+    ports: ["127.0.0.1:8083:8080"]
+    volumes: ["node3:/data"]
+
+volumes:
+  node1:
+  node2:
+  node3:

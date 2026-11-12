@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"time"
 
@@ -87,7 +86,7 @@ func mainRun(args []string, stdout, stderr io.Writer) int {
 		if minTimeout > timeout {
 			timeout = minTimeout
 		}
-		return jobqhttp.NewClient(g.addr, jobqhttp.WithHTTPClient(&http.Client{Timeout: timeout}))
+		return jobqhttp.NewClient(g.addr, jobqhttp.WithTimeout(timeout))
 	}
 
 	// newClient's type (func(minTimeout time.Duration) *jobqhttp.Client) is
@@ -138,6 +137,8 @@ Flags come before positional arguments (stdlib flag package, not getopt):
   jobq recovery
   jobq work    [--visibility 30s] [--wait 20s] [--max-jobs N] <topic> -- <cmd> [args...]
 
---addr defaults to $JOBQ_ADDR or http://127.0.0.1:8080. --addr/--timeout/--json
-may appear before or after the subcommand name, but still before <topic>.
+--addr defaults to $JOBQ_ADDR or http://127.0.0.1:8080. For a cluster, give
+every node separated by commas; the leader is found and followed for you.
+--addr/--timeout/--json may appear before or after the subcommand name, but
+still before <topic>.
 Exit codes: 0 ok, 1 error, 2 usage, 3 no job available.`

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aleks-drozy/jobq"
@@ -20,23 +21,77 @@ import (
 // and implements jobq.Client, so callers can use a remote queue exactly like
 // a local *jobq.Queue for the five lifecycle methods. roundtrip_test.go
 // pins that the two behave identically, sentinel errors included.
+//
+// Against a cluster, give it every node's address. It sends each request
+// to the node it believes leads and moves on when it is wrong: to the
+// address a follower names, or to the next one in the list when a node
+// cannot be reached. It keeps trying for the retry budget (default 10s),
+// which is what carries a caller across a change of leader.
+//
+// Two things follow from retrying, and both are within at-least-once. A
+// request that failed in transit may have been applied before the retry
+// applies it again, so an enqueue can land twice. And an ack that was
+// applied before its reply was lost comes back from the retry as
+// jobq.ErrUnknownLease: the job is settled even though the call failed.
 type Client struct {
-	baseURL string
-	httpc   *http.Client
+	addrs []string
+	httpc *http.Client
+	retry time.Duration
+
+	mu         sync.Mutex
+	target     string // where the next request goes
+	next       int    // index into addrs to rotate to
+	redirected bool   // a node has answered not_leader: this is a cluster
 }
 
 // ClientOption configures a Client.
 type ClientOption func(*Client)
 
-// WithHTTPClient replaces the underlying http.Client (for custom
-// transports, timeouts, or TLS config).
+// WithHTTPClient replaces the underlying http.Client (for a custom
+// transport or TLS config). To change only the timeout, use WithTimeout,
+// which keeps the connection pool NewClient sets up.
 func WithHTTPClient(c *http.Client) ClientOption {
 	return func(cl *Client) { cl.httpc = c }
 }
 
+// WithTimeout sets the per-request timeout (default 10s). It must exceed
+// the longest DequeueWait the caller intends to make.
+func WithTimeout(d time.Duration) ClientOption {
+	return func(cl *Client) { cl.httpc.Timeout = d }
+}
+
+// newTransport is http.DefaultTransport with a connection pool sized for
+// how a queue is used: many workers, one host. The default keeps two idle
+// connections per host, so a pool of ten workers sharing a Client would
+// open and close a connection on most requests. Under load that is slow,
+// and on a busy machine it runs the operating system out of local ports.
+func newTransport() *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 256
+	tr.MaxIdleConnsPerHost = 64
+	return tr
+}
+
+// WithRetryBudget sets how long a request against a cluster keeps trying
+// other nodes before giving up (default 10s). Zero means one try.
+func WithRetryBudget(d time.Duration) ClientOption {
+	return func(cl *Client) { cl.retry = d }
+}
+
 // NewClient builds a Client pointed at baseURL (e.g. "http://127.0.0.1:8080").
+// For a cluster, baseURL is every node's address separated by commas.
 func NewClient(baseURL string, opts ...ClientOption) *Client {
-	c := &Client{baseURL: strings.TrimSuffix(baseURL, "/"), httpc: &http.Client{Timeout: 10 * time.Second}}
+	c := &Client{httpc: &http.Client{Timeout: 10 * time.Second, Transport: newTransport()}, retry: 10 * time.Second}
+	for _, a := range strings.Split(baseURL, ",") {
+		if a = strings.TrimSuffix(strings.TrimSpace(a), "/"); a != "" {
+			c.addrs = append(c.addrs, a)
+		}
+	}
+	if len(c.addrs) == 0 {
+		c.addrs = []string{""}
+	}
+	c.target = c.addrs[0]
+	c.next = 1 % len(c.addrs)
 	for _, opt := range opts {
 		opt(c)
 	}
@@ -185,6 +240,14 @@ func (c *Client) Peek(topic string, limit int, includeInflight bool) (ready, inf
 	return ready, inflight, resp.Truncated, nil
 }
 
+// ClusterStatus fetches one node's view of its cluster. Against a server
+// that is not part of a cluster it returns an error.
+func (c *Client) ClusterStatus() (ClusterStatus, error) {
+	var resp ClusterStatus
+	err := c.doJSON(context.Background(), http.MethodGet, "/v1/cluster", nil, &resp, http.StatusOK)
+	return resp, err
+}
+
 // Health fetches server health.
 func (c *Client) Health() (status string, durable bool, uptime time.Duration, err error) {
 	var resp healthResponseDTO
@@ -213,25 +276,110 @@ var errNoContent = errors.New("jobqhttp: no content")
 // into respBody (skipped if nil) on wantStatus. Any other status is parsed
 // as an errorEnvelope and translated via errorFromEnvelope; a 204 when
 // wantStatus is 200 is reported as errNoContent for Dequeue to interpret.
+//
+// Against a cluster it retries as described on Client. Against a single
+// server it makes exactly one request, as it always has.
 func (c *Client) doJSON(ctx context.Context, method, path string, reqBody, respBody any, wantStatus int) error {
-	var body io.Reader
+	var body []byte
 	if reqBody != nil {
 		b, err := json.Marshal(reqBody)
 		if err != nil {
 			return fmt.Errorf("jobqhttp: encoding request: %w", err)
 		}
-		body = bytes.NewReader(b)
+		body = b
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+	deadline := time.Now().Add(c.retry)
+	for hops := 0; ; hops++ {
+		base := c.currentTarget()
+		err := c.once(ctx, base, method, path, body, respBody, wantStatus)
+		pause, again := c.reroute(base, err)
+		// A hint is followed at once, but not forever: two nodes each
+		// naming the other during an election must not spin. Everything
+		// else backs off, so a cluster that is down is not also flooded.
+		if pause > 0 || hops >= 3 {
+			pause = retryPause << min(hops, 3)
+		}
+		if !again || ctx.Err() != nil || !time.Now().Add(pause).Before(deadline) {
+			return err
+		}
+		if pause > 0 {
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(pause):
+			}
+		}
+	}
+}
+
+const retryPause = 25 * time.Millisecond
+
+func (c *Client) currentTarget() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.target
+}
+
+// reroute decides, from the outcome of a request sent to base, whether to
+// try again and where. It retries only what a different node could answer
+// differently: a refusal by a node that is not the leader, a node that is
+// shutting down, and a node that could not be reached at all.
+func (c *Client) reroute(base string, err error) (pause time.Duration, again bool) {
+	if err == nil {
+		return 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var nl *jobq.NotLeaderError
+	var transport *transportError
+	switch {
+	case errors.As(err, &nl):
+		c.redirected = true
+		if nl.Leader != "" && nl.Leader != base {
+			if c.target == base {
+				c.target = strings.TrimSuffix(nl.Leader, "/")
+			}
+			return 0, true
+		}
+		// No leader known yet: an election is under way. Look elsewhere
+		// after a pause.
+	case errors.Is(err, jobq.ErrClosed), errors.As(err, &transport):
+		if len(c.addrs) < 2 && !c.redirected {
+			return 0, false // a single server: nowhere else to go
+		}
+	default:
+		return 0, false
+	}
+	if c.target == base { // unless another goroutine already moved on
+		c.target = c.addrs[c.next]
+		c.next = (c.next + 1) % len(c.addrs)
+	}
+	return retryPause, true
+}
+
+// transportError marks a request that got no HTTP response: the server
+// could not be reached, or the connection died first.
+type transportError struct{ err error }
+
+func (e *transportError) Error() string { return "jobqhttp: request failed: " + e.err.Error() }
+func (e *transportError) Unwrap() error { return e.err }
+
+// once makes a single request to one server.
+func (c *Client) once(ctx context.Context, base, method, path string, body []byte, respBody any, wantStatus int) error {
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+path, rd)
 	if err != nil {
 		return fmt.Errorf("jobqhttp: building request: %w", err)
 	}
-	if reqBody != nil {
+	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.httpc.Do(req)
 	if err != nil {
-		return fmt.Errorf("jobqhttp: request failed: %w", err)
+		return &transportError{err}
 	}
 	defer resp.Body.Close()
 

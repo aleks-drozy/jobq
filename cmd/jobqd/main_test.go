@@ -7,6 +7,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -150,4 +152,95 @@ func waitForServer(t *testing.T, addr string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("server at %s never became reachable", addr)
+}
+
+func TestParseNodeMap(t *testing.T) {
+	got, err := parseNodeMap("peers", " 1=http://a:9090, 2=https://b:9090/ ,3=http://c:9090")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[1] != "http://a:9090" || got[2] != "https://b:9090/" || got[3] != "http://c:9090" {
+		t.Fatalf("parsed %v", got)
+	}
+	for _, bad := range []string{
+		"http://a:9090",              // no ID
+		"0=http://a:9090",            // zero is reserved
+		"x=http://a:9090",            // not a number
+		"1=a:9090",                   // no scheme
+		"1=",                         // no URL
+		"1=http://a,1=http://b:9090", // listed twice
+	} {
+		if _, err := parseNodeMap("peers", bad); err == nil {
+			t.Errorf("parseNodeMap(%q) succeeded", bad)
+		}
+	}
+}
+
+func TestClusterFlagsAreValidated(t *testing.T) {
+	const peers = "1=http://a:9090,2=http://b:9090,3=http://c:9090"
+	dir := t.TempDir()
+	ok := []string{"-id", "2", "-dir", dir, "-peers", peers, "-advertise", "1=http://a:8080,2=http://b:8080"}
+	c, err := parseFlags(ok)
+	if err != nil {
+		t.Fatalf("valid cluster flags rejected: %v", err)
+	}
+	cc, err := parseClusterFlags(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc.id != 2 || len(cc.ids) != 3 || cc.ids[0] != 1 || cc.ids[2] != 3 || cc.advertise[2] != "http://b:8080" {
+		t.Fatalf("cluster config %+v", cc)
+	}
+	if c.peerAddr != "127.0.0.1:9090" {
+		t.Errorf("default peer address = %q, want 127.0.0.1:9090 (no auth, must not default to 0.0.0.0)", c.peerAddr)
+	}
+
+	bad := map[string][]string{
+		"no id":                    {"-dir", dir, "-peers", peers},
+		"id not in peers":          {"-id", "9", "-dir", dir, "-peers", peers},
+		"no data directory":        {"-id", "1", "-peers", peers},
+		"advertise names stranger": {"-id", "1", "-dir", dir, "-peers", peers, "-advertise", "7=http://z:8080"},
+		"malformed peers":          {"-id", "1", "-dir", dir, "-peers", "1:http://a"},
+	}
+	for name, args := range bad {
+		if _, err := parseFlags(args); err == nil {
+			t.Errorf("%s: flags %v were accepted", name, args)
+		}
+	}
+}
+
+// A killed jobqd leaves its lock behind. Without -break-lock the next start
+// must refuse the directory; with it, the start must succeed.
+func TestBreakLockRemovesAStaleLock(t *testing.T) {
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "jobq.lock")
+	if err := os.WriteFile(lock, []byte("99999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := openQueue(config{dir: dir, sync: "always"}, testLogger(t)); err == nil {
+		t.Fatal("a locked directory was opened without -break-lock")
+	}
+	if err := breakStaleLock(config{dir: dir, breakLock: true}, testLogger(t)); err != nil {
+		t.Fatal(err)
+	}
+	q, _, err := openQueue(config{dir: dir, sync: "always"}, testLogger(t))
+	if err != nil {
+		t.Fatalf("after -break-lock: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing to remove is not an error, and without the flag nothing is touched.
+	if err := breakStaleLock(config{dir: dir, breakLock: true}, testLogger(t)); err != nil {
+		t.Errorf("no lock present: %v", err)
+	}
+	if err := os.WriteFile(lock, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := breakStaleLock(config{dir: dir}, testLogger(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(lock); err != nil {
+		t.Errorf("lock removed without -break-lock: %v", err)
+	}
 }

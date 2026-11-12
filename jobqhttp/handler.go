@@ -1,6 +1,8 @@
-// Package jobqhttp is an HTTP surface over a *jobq.Queue, and the Client
-// that talks to it. Server and client share this package so the wire types
-// in wire.go are declared exactly once.
+// Package jobqhttp is an HTTP surface over a queue, and the Client that
+// talks to it. The queue is a local *jobq.Queue or one node of a replicated
+// cluster (*cluster.Node); the API is the same either way. Server and
+// client share this package so the wire types in wire.go are declared
+// exactly once.
 package jobqhttp
 
 import (
@@ -15,7 +17,29 @@ import (
 	"time"
 
 	"github.com/aleks-drozy/jobq"
+	"github.com/aleks-drozy/jobq/cluster"
 )
+
+// Backend is what the handler serves: the five lifecycle calls plus the
+// read-only ones. *jobq.Queue and *cluster.Node both satisfy it.
+type Backend interface {
+	jobq.Client
+	Stats(topic string) jobq.Stats
+	Topics() []string
+	Peek(topic string, limit int, includeInflight bool) (ready, inflight []*jobq.Job, err error)
+}
+
+var (
+	_ Backend = (*jobq.Queue)(nil)
+	_ Backend = (*cluster.Node)(nil)
+)
+
+// clusterBackend is the extra a replicated node offers; a plain queue does
+// not implement it, and GET /v1/cluster says so.
+type clusterBackend interface {
+	Status() cluster.Status
+	LeaderAddr() string
+}
 
 const (
 	defaultMaxPayload    = 1 << 20 // 1 MiB
@@ -82,14 +106,14 @@ func WithRecovery(report jobq.RecoveryReport, dir, sync string) HandlerOption {
 }
 
 type handler struct {
-	q    *jobq.Queue
+	q    Backend
 	opts handlerOptions
 }
 
 // NewHandler builds the HTTP surface for q. See the package doc and
 // docs/specs/2026-07-30-jobq-p3-http.md for the route table and error
 // envelope shape.
-func NewHandler(q *jobq.Queue, opts ...HandlerOption) http.Handler {
+func NewHandler(q Backend, opts ...HandlerOption) http.Handler {
 	o := handlerOptions{
 		maxPayload:    defaultMaxPayload,
 		maxWait:       defaultMaxWait,
@@ -114,6 +138,7 @@ func NewHandler(q *jobq.Queue, opts ...HandlerOption) http.Handler {
 	mux.HandleFunc("GET /v1/stats", h.handleStats)
 	mux.HandleFunc("GET /v1/health", h.handleHealth)
 	mux.HandleFunc("GET /v1/recovery", h.handleRecovery)
+	mux.HandleFunc("GET /v1/cluster", h.handleCluster)
 	return mux
 }
 
@@ -138,7 +163,36 @@ func writeErrorEnvelope(w http.ResponseWriter, status int, code, message string)
 // themselves — it is 204, not an error.
 func writeEngineError(w http.ResponseWriter, err error) {
 	status, code := statusAndCodeFor(err)
-	writeErrorEnvelope(w, status, code, err.Error())
+	body := errorBody{Code: code, Message: err.Error()}
+	// A node that is not the leader says who is, when it knows, so a
+	// client can go straight there instead of trying every address.
+	var nl *jobq.NotLeaderError
+	if errors.As(err, &nl) {
+		body.Leader = nl.Leader
+	}
+	writeJSON(w, status, errorEnvelope{Error: body})
+}
+
+// handleCluster implements GET /v1/cluster: this node's view of the
+// cluster. It is answered from the node's own state without consulting
+// anyone, so a node cut off from the others reports what it last knew.
+func (h *handler) handleCluster(w http.ResponseWriter, r *http.Request) {
+	cb, ok := h.q.(clusterBackend)
+	if !ok {
+		writeErrorEnvelope(w, http.StatusNotFound, "not_clustered", "this server is a single node, not part of a cluster")
+		return
+	}
+	st := cb.Status()
+	writeJSON(w, http.StatusOK, ClusterStatus{
+		ID:         uint64(st.ID),
+		State:      st.State.String(),
+		Term:       st.Term,
+		Leader:     uint64(st.Leader),
+		LeaderAddr: cb.LeaderAddr(),
+		Commit:     st.Commit,
+		Applied:    st.Applied,
+		LastIndex:  st.LastIndex,
+	})
 }
 
 // decodeJSON reads a JSON body with unknown fields rejected, under

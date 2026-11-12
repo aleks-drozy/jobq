@@ -31,7 +31,33 @@ var (
 	// ErrNonPositiveDuration means a visibility timeout or extension was
 	// zero or negative, which would issue an already-expired lease.
 	ErrNonPositiveDuration = errors.New("jobq: duration must be positive")
+	// ErrNotLeader means a replicated node was asked to change the queue
+	// but is not the cluster's leader. The operation was not applied. The
+	// error may be a *NotLeaderError carrying the leader's address.
+	ErrNotLeader = errors.New("jobq: not the leader")
+	// ErrUnavailable means a replicated node accepted the operation but
+	// could not confirm, in time, that a majority committed it. The
+	// outcome is unknown: it may still be applied. A single-node queue
+	// never returns it.
+	ErrUnavailable = errors.New("jobq: outcome unknown, cluster did not confirm in time")
 )
+
+// NotLeaderError is ErrNotLeader with a hint. Leader is the client address
+// of the node believed to lead, or empty when no leader is known (an
+// election is in progress, or the node was not told its peers' addresses).
+type NotLeaderError struct {
+	Leader string
+}
+
+func (e *NotLeaderError) Error() string {
+	if e.Leader == "" {
+		return ErrNotLeader.Error() + " (no leader known)"
+	}
+	return ErrNotLeader.Error() + " (leader is " + e.Leader + ")"
+}
+
+// Is makes errors.Is(err, ErrNotLeader) true for a *NotLeaderError.
+func (e *NotLeaderError) Is(target error) bool { return target == ErrNotLeader }
 
 // DefaultMaxAttempts is used when EnqueueOptions.MaxAttempts is zero.
 const DefaultMaxAttempts = 5
