@@ -50,6 +50,10 @@ type ClientOption func(*Client)
 // WithHTTPClient replaces the underlying http.Client (for a custom
 // transport or TLS config). To change only the timeout, use WithTimeout,
 // which keeps the connection pool NewClient sets up.
+//
+// The default client refuses HTTP redirects. A replacement is used as it
+// is given: unless its CheckRedirect does the same, a server can redirect
+// requests, payloads included, to an address the caller never configured.
 func WithHTTPClient(c *http.Client) ClientOption {
 	return func(cl *Client) { cl.httpc = c }
 }
@@ -59,6 +63,13 @@ func WithHTTPClient(c *http.Client) ClientOption {
 func WithTimeout(d time.Duration) ClientOption {
 	return func(cl *Client) { cl.httpc.Timeout = d }
 }
+
+// noRedirect makes a 3xx the response, not something to follow. jobqd never
+// redirects, and following one would let whatever answers on a configured
+// address send the request, body included on a 307 or 308, anywhere it
+// likes. The leader hint is checked against the configured addresses for
+// the same reason; see reroute.
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 // newTransport is http.DefaultTransport with a connection pool sized for
 // how a queue is used: many workers, one host. The default keeps two idle
@@ -83,7 +94,7 @@ func WithRetryBudget(d time.Duration) ClientOption {
 // leader hint is followed only to one of these addresses, so list them all:
 // a client given one follower's address gets jobq.ErrNotLeader back.
 func NewClient(baseURL string, opts ...ClientOption) *Client {
-	c := &Client{httpc: &http.Client{Timeout: 10 * time.Second, Transport: newTransport()}, retry: 10 * time.Second}
+	c := &Client{httpc: &http.Client{Timeout: 10 * time.Second, Transport: newTransport(), CheckRedirect: noRedirect}, retry: 10 * time.Second}
 	for _, a := range strings.Split(baseURL, ",") {
 		if a = strings.TrimSuffix(strings.TrimSpace(a), "/"); a != "" {
 			c.addrs = append(c.addrs, a)

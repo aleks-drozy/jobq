@@ -410,3 +410,29 @@ func TestClientIgnoresHintToUnconfiguredAddress(t *testing.T) {
 		t.Fatalf("%d requests reached an address the client was never given", n)
 	}
 }
+
+// The same rule for HTTP redirects: the client does not follow them, so a
+// 307 cannot carry a payload to an address the caller never named.
+func TestClientDoesNotFollowRedirects(t *testing.T) {
+	var strayHits atomic.Int64
+	stray := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		strayHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer stray.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, stray.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	cl := NewClient(srv.URL)
+	if _, err := cl.Enqueue("work", []byte("secret")); err == nil {
+		t.Fatal("enqueue through a redirecting server succeeded")
+	}
+	if _, err := cl.Stats(); err == nil {
+		t.Fatal("stats through a redirecting server succeeded")
+	}
+	if n := strayHits.Load(); n != 0 {
+		t.Fatalf("%d requests followed a redirect", n)
+	}
+}
