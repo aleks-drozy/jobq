@@ -194,6 +194,29 @@ isn't anymore, why it needed one new engine primitive (`Queue.Peek`, a
 read-only inspection path, because `Dequeue` is the only other one and it
 mutates), and the crash-recovery-diagnosis demo in `mcp/demo/`.
 
+## Replication (in progress)
+
+`raft/` is a from-scratch Raft implementation, standard library only:
+leader election, log replication, the commit rule, and persistence of term,
+vote and log. The queue does not use it yet. It exists first on its own so
+the algorithm can be trusted before anything is built on it.
+
+A node does no I/O and owns no goroutines, so a seeded simulator drives
+whole clusters through dropped, duplicated and reordered messages, crashes,
+restarts, partitions and slow clocks, and checks the Raft safety properties
+after every step. 10,000 seeds run clean under the race detector, and any
+failing seed replays exactly:
+
+```
+go test ./raft -run 'TestSimulation$' -raft.sims=10000
+```
+
+The same suite plants three real Raft bugs one at a time and requires the
+simulator to catch each. One of them survived 3,000 seeds of the default
+fault mix before a harsher one found it. See
+`docs/specs/2026-11-11-jobq-r1-raft.md` for the design, the numbers, and
+what that says about how far to trust a clean run.
+
 ## Not in v1
 
 Replication, clustering, consumer-group fan-out, priorities, cron

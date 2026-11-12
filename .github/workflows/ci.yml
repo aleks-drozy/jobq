@@ -17,6 +17,8 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
       - run: go test -race -count=1 ./...
+      - name: raft simulation, 10000 seeds
+        run: go test -count=1 -run 'TestSimulation$' ./raft -raft.sims=10000
       - name: standard library only
         run: |
           deps="$(go list -m all | tail -n +2)"
