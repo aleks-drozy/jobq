@@ -179,11 +179,11 @@ func TestFollowerAnswersWithLeaderHint(t *testing.T) {
 	}
 }
 
-// Given only a follower's address, the client follows the hint and the
-// caller never learns there was more than one node.
+// Pointed first at a follower, the client follows the hint and the caller
+// never learns it was not talking to the leader.
 func TestClientFollowsHintFromAFollower(t *testing.T) {
 	c := newHTTPCluster(t)
-	cl := NewClient(c.clients[c.follower()].URL)
+	cl := NewClient(c.clients[c.follower()].URL + "," + c.allAddrs())
 
 	id, err := cl.Enqueue("work", []byte("hello"))
 	if err != nil {
@@ -373,5 +373,40 @@ func TestClientReusesConnections(t *testing.T) {
 	if got := opened.Load(); got > 2*workers {
 		t.Fatalf("%d requests from %d workers opened %d connections; they are not being reused",
 			workers*each, workers, got)
+	}
+}
+
+// A hint is followed only to an address the caller configured. A server
+// that names somewhere else, by mistake or on purpose, must not be able to
+// send the caller's payloads there.
+func TestClientIgnoresHintToUnconfiguredAddress(t *testing.T) {
+	var strayHits atomic.Int64
+	stray := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		strayHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer stray.Close()
+	liar := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeEngineError(w, &jobq.NotLeaderError{Leader: stray.URL})
+		}))
+	}
+	a, b := liar(), liar()
+	defer a.Close()
+	defer b.Close()
+
+	// One address: the refusal comes straight back, naming the leader.
+	_, err := NewClient(a.URL).Enqueue("work", []byte("secret"))
+	var nl *jobq.NotLeaderError
+	if !errors.As(err, &nl) || nl.Leader != stray.URL {
+		t.Fatalf("single address: err = %v, want a NotLeaderError naming %s", err, stray.URL)
+	}
+	// Several: the client rotates among its own until the budget runs out.
+	_, err = NewClient(a.URL+","+b.URL, WithRetryBudget(200*time.Millisecond)).Enqueue("work", []byte("secret"))
+	if !errors.Is(err, jobq.ErrNotLeader) {
+		t.Fatalf("two addresses: err = %v, want ErrNotLeader", err)
+	}
+	if n := strayHits.Load(); n != 0 {
+		t.Fatalf("%d requests reached an address the client was never given", n)
 	}
 }

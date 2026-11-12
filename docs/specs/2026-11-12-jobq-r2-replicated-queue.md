@@ -95,8 +95,10 @@ sync loses only what nobody outside the process had heard about.
 
 **A follower says who leads.** A write sent to a follower gets
 `421 not_leader` and the leader's client address. The client follows the
-hint, rotates through its list when a node cannot be reached, and backs
-off between tries. It retries only what another node could answer
+hint if it names one of the addresses the caller configured, and otherwise
+rotates through its own list: a server cannot send a caller's requests to
+an address the caller never named. It also rotates when a node cannot be
+reached, and backs off between tries. It retries only what another node could answer
 differently: a clean refusal, a node shutting down, or no connection at
 all. "Outcome unknown" (`503 unavailable`) is returned to the caller,
 because retrying it is a decision about duplicates that belongs to them.

@@ -79,7 +79,9 @@ func WithRetryBudget(d time.Duration) ClientOption {
 }
 
 // NewClient builds a Client pointed at baseURL (e.g. "http://127.0.0.1:8080").
-// For a cluster, baseURL is every node's address separated by commas.
+// For a cluster, baseURL is every node's address separated by commas. A
+// leader hint is followed only to one of these addresses, so list them all:
+// a client given one follower's address gets jobq.ErrNotLeader back.
 func NewClient(baseURL string, opts ...ClientOption) *Client {
 	c := &Client{httpc: &http.Client{Timeout: 10 * time.Second, Transport: newTransport()}, retry: 10 * time.Second}
 	for _, a := range strings.Split(baseURL, ",") {
@@ -335,14 +337,22 @@ func (c *Client) reroute(base string, err error) (pause time.Duration, again boo
 	switch {
 	case errors.As(err, &nl):
 		c.redirected = true
-		if nl.Leader != "" && nl.Leader != base {
+		// The hint is whatever the answering server chose to say. It is
+		// followed only to an address the caller configured, so no server
+		// can send the caller's requests, payloads included, somewhere
+		// the caller never named.
+		if hint := strings.TrimSuffix(nl.Leader, "/"); hint != base && c.configured(hint) {
 			if c.target == base {
-				c.target = strings.TrimSuffix(nl.Leader, "/")
+				c.target = hint
 			}
 			return 0, true
 		}
-		// No leader known yet: an election is under way. Look elsewhere
-		// after a pause.
+		if len(c.addrs) < 2 {
+			return 0, false // one address, and it is not the leader's
+		}
+		// No leader known yet (an election is under way), or one named at
+		// an address this client was not given. Look elsewhere after a
+		// pause.
 	case errors.Is(err, jobq.ErrClosed), errors.As(err, &transport):
 		if len(c.addrs) < 2 && !c.redirected {
 			return 0, false // a single server: nowhere else to go
@@ -355,6 +365,17 @@ func (c *Client) reroute(base string, err error) (pause time.Duration, again boo
 		c.next = (c.next + 1) % len(c.addrs)
 	}
 	return retryPause, true
+}
+
+// configured reports whether addr is one of the addresses the client was
+// built with. The caller holds c.mu.
+func (c *Client) configured(addr string) bool {
+	for _, a := range c.addrs {
+		if a == addr && a != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // transportError marks a request that got no HTTP response: the server
