@@ -26,9 +26,16 @@
 # iptables rule, so that there is nothing to install and nothing outside
 # the namespaces is touched. Everything this script creates is named jobq*
 # and `down` removes all of it.
+#
+# The lab directory holds a binary this script runs as root, pid files it
+# sends SIGKILL to and logs it appends to. Anyone who can write there can
+# have root run their program, kill a process of their choosing or write
+# through a link of theirs. So the directory must be root's alone, and the
+# script refuses any other: it is created 0700 under /var/lib, never in a
+# shared temporary directory. chaos/local.sh installs the binaries into it.
 set -euo pipefail
 
-LAB=${JOBQ_CHAOS_DIR:-/var/tmp/jobq-chaos}
+LAB=${JOBQ_CHAOS_DIR:-/var/lib/jobq-chaos}
 JOBQD=${JOBQD:-$LAB/bin/jobqd}
 NET=${JOBQ_CHAOS_NET:-10.77.0}
 DELAY=${JOBQ_CHAOS_DELAY:-100ms}
@@ -41,6 +48,31 @@ IDS="1 2 3"
 die() { echo "netns.sh: $*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "must run as root (it creates network namespaces)"
+
+# roots_alone PATH: owned by root, and writable by nobody else.
+roots_alone() {
+  local st
+  st=$(stat -c '%u %a' -- "$1") || die "cannot stat $1"
+  [ "${st% *}" = 0 ] || die "$1 is not owned by root: refusing to trust it"
+  (( (8#${st#* } & 022) == 0 )) || die "$1 is writable by group or others: refusing to trust it"
+}
+
+# lab_dir: the lab directory is a real directory and root's alone.
+# `up` creates it; everything else requires it.
+lab_dir() {
+  [ ! -L "$LAB" ] || die "$LAB is a symbolic link: refusing to trust it"
+  [ -d "$LAB" ] || die "no lab directory at $LAB (run chaos/local.sh, or 'netns.sh up')"
+  roots_alone "$LAB"
+}
+
+# jobqd_ok: there is a jobqd, and it is root's alone. It is about to run as
+# root: a binary someone else can replace, or one in a directory where
+# someone else can swap it, is theirs to choose.
+jobqd_ok() {
+  [ -x "$JOBQD" ] || die "no jobqd at $JOBQD (chaos/local.sh installs one)"
+  roots_alone "$JOBQD"
+  roots_alone "$(dirname -- "$JOBQD")"
+}
 
 valid_id() {
   case " $IDS " in *" $1 "*) ;; *) die "no such node: '${1:-}' (have $IDS)" ;; esac
@@ -63,7 +95,7 @@ running() { # running ID: is the node's jobqd alive (and not a zombie)?
 start() {
   valid_id "$1"
   running "$1" && die "node $1 is already running"
-  [ -x "$JOBQD" ] || die "no jobqd at $JOBQD (build one for linux and set JOBQD)"
+  jobqd_ok
   mkdir -p "$LAB/node$1"
   # -break-lock: this script is the supervisor. It starts a node only
   # after checking, just above, that the last one is gone.
@@ -128,7 +160,7 @@ fast() {
 
 up() {
   ip link show "$BRIDGE" >/dev/null 2>&1 && die "$BRIDGE already exists: run 'netns.sh down' first"
-  mkdir -p "$LAB"
+  jobqd_ok # before any network exists, so that a refusal leaves nothing behind
   ip link add "$BRIDGE" type bridge
   ip addr add "$NET.254/24" dev "$BRIDGE"
   ip link set "$BRIDGE" up
@@ -173,12 +205,22 @@ status() {
 }
 
 case "${1:-}" in
-  up) up ;;
-  down) down ;;
+  up)
+    [ -e "$LAB" ] || [ -L "$LAB" ] || install -d -m 0700 -o root -g root -- "$LAB"
+    lab_dir
+    up
+    ;;
+  down)
+    # With no lab directory there are no pid files to act on, only the
+    # network to remove. With one, it is checked before a pid in it is
+    # believed.
+    if [ -e "$LAB" ] || [ -L "$LAB" ]; then lab_dir; fi
+    down
+    ;;
   nodes) node_map 8080 ;;
-  status) status ;;
-  start) start "${2:-}" ;;
-  kill) kill_node "${2:-}" ;;
+  status) lab_dir; status ;;
+  start) lab_dir; start "${2:-}" ;;
+  kill) lab_dir; kill_node "${2:-}" ;;
   isolate) isolate "${2:-}" ;;
   heal) heal "${2:-}" ;;
   slow) slow "${2:-}" ;;

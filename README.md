@@ -311,7 +311,7 @@ format, written by hand.
   broken it fails three times out of three.
 
   ```
-  GOOS=linux go build -o /var/tmp/jobq-chaos/bin/ ./cmd/jobqd ./cmd/jobqchaos
+  GOOS=linux go build -o chaos/bin/ ./cmd/jobqd ./cmd/jobqchaos
   sudo chaos/local.sh -runs 10
   ```
 

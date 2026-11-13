@@ -235,14 +235,23 @@ the harness also reports.
 On any Linux with root, iproute2 and the `sch_netem` module:
 
 ```
-GOOS=linux go build -o /var/tmp/jobq-chaos/bin/ ./cmd/jobqd ./cmd/jobqchaos
+GOOS=linux go build -o chaos/bin/ ./cmd/jobqd ./cmd/jobqchaos
 sudo chaos/local.sh -runs 10
 ```
 
-`local.sh` builds the lab, runs the matrix, and takes the lab down
-whatever happens. Results go to `/var/tmp/jobq-chaos/results` as
-`results.json` (every run) and `results.md` (the tables). The exit status
-is 0 only if the contract held and every fault was seen.
+`local.sh` installs the two binaries into the lab directory, builds the
+lab, runs the matrix, and takes the lab down whatever happens. Results go
+to `/var/lib/jobq-chaos/results` as `results.json` (every run) and
+`results.md` (the tables), or wherever `-out` says. The exit status is 0
+only if the contract held and every fault was seen.
+
+The lab directory is root's alone, and `netns.sh` refuses one that is not.
+It runs `jobqd` from there as root, kills the pids recorded there and
+appends to logs there, so a directory anyone else could write to would
+let them have root run their program. The first version used
+`/var/tmp/jobq-chaos`, under a directory every user can write to; an
+automated review of the commit caught it. The runs above were made with
+that version, on a machine with one user.
 
 Against a cluster that already exists, `jobqchaos -nodes ... -hook ...`
 with a hook that implements the six verbs for it.
