@@ -9,6 +9,7 @@
 *.exe
 /jobqd
 /jobq
+/jobqchaos
 /mcp/cmd/jobq-mcp/jobq-mcp
 
 # WAL segment files, in case a data directory ends up somewhere git would
@@ -23,3 +24,5 @@
 *.tfvars
 # The linux/arm64 jobqd built for upload (see RUNBOOK.md).
 /deploy/terraform/build/
+# The linux builds chaos/local.sh installs into the lab.
+/chaos/bin/
