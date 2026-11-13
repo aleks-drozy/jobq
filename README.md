@@ -299,6 +299,33 @@ format, written by hand.
   ```
   go test ./cmd/jobqd -run TestClusterLosesNothing -v
   ```
+- `cmd/jobqchaos` and `chaos/`: the fault matrix. Three `jobqd` nodes, each
+  in its own Linux network namespace, with clients working throughout
+  while one fault at a time is applied, held for three seconds and undone:
+  the leader or a follower killed, the leader or a follower cut off from
+  the other two, every link made slow and lossy (100 ms, 5% loss). A fault
+  that is not seen to take effect fails the run, so a hook that does
+  nothing cannot produce a clean report. Across 60 faults on one laptop:
+  21,501 acknowledged enqueues, 0 lost, 0 acked jobs delivered again, 97
+  delivered twice. Against a build with the commit rule deliberately
+  broken it fails three times out of three.
+
+  ```
+  GOOS=linux go build -o /var/tmp/jobq-chaos/bin/ ./cmd/jobqd ./cmd/jobqchaos
+  sudo chaos/local.sh -runs 10
+  ```
+
+**What the faults cost**, on that laptop, in milliseconds as median /
+worst of ten runs. One kernel and one disk stand in for three machines, so
+these show the shape and not what a real network would give:
+
+| Fault | Writes resume after | Longest stall | Why |
+|---|---|---|---|
+| Leader killed | 406 / 1,731 | 349 / 1,586 | one election, about 250 ms; one run in ten took seven terms |
+| Follower killed | no interruption | 36 / 112 | a majority is still there |
+| Leader cut off, clients still reach it | 3,397 / 3,832 | 3,316 / 3,786 | a new leader in 376 ms, but calls in flight on the old one wait out its 5 s timeout or the partition, whichever ends first |
+| Follower cut off | no interruption | 401 / 742 | the stall is on its return: with no pre-vote it comes back terms ahead and unseats the leader, ten times out of ten |
+| 100 ms, 5% loss on every link | 3,635 / 4,246 | 3,342 / 3,984 | the default 10 ms tick cannot hold a leader on that link; with `-tick 50ms` it does, at 397 ms a write |
 
 **What snapshots buy**, measured once on that laptop with 500,000 jobs
 through one durable node, 50,000 of them still queued at the end:
@@ -311,8 +338,12 @@ through one durable node, 50,000 of them still queued at the end:
 
 and what they cost: taking that snapshot stopped the node for 99 ms.
 
-**What this does not do yet.** It has run only on loopback, never across
-machines, and the Docker and AWS files have never been run at all. A
+**What this does not do yet.** It has run only on one machine, never
+across several, and the Docker and AWS files have never been run at all.
+A leader cut off from the others keeps its waiting callers for up to five
+seconds before telling them it cannot answer, and a node returning from a
+partition forces an election; both are measured above and neither is
+fixed. A
 snapshot stops the node that takes it until it is on disk, and is sent to
 a follower as one message, so this design does not suit a queue holding
 gigabytes. Membership is fixed: replacing a dead node is a manual
@@ -324,9 +355,10 @@ power: these tests do not prove fsync is honoured by the disk. Nothing
 here says how fast it is over a real network.
 
 See `docs/specs/2026-11-11-jobq-r1-raft.md`,
-`docs/specs/2026-11-12-jobq-r2-replicated-queue.md` and
-`docs/specs/2026-11-13-jobq-r3-snapshots.md` for the designs, the numbers,
-and how far to trust them.
+`docs/specs/2026-11-12-jobq-r2-replicated-queue.md`,
+`docs/specs/2026-11-13-jobq-r3-snapshots.md` and
+`docs/specs/2026-11-13-jobq-r4-chaos-local.md` for the designs, the
+numbers, and how far to trust them.
 
 ## Not in v1
 

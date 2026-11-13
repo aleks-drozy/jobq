@@ -1,0 +1,148 @@
+{
+  "started": "2026-11-13T20:12:20.96547224Z",
+  "finished": "2026-11-13T20:13:25.249354377Z",
+  "seed": 1794600740965210230,
+  "nodes": 3,
+  "runs_per_fault": 5,
+  "hold_ms": 8000,
+  "settle_ms": 2000,
+  "producers": 3,
+  "consumers": 4,
+  "pace_ms": 5,
+  "faults": [
+    {
+      "fault": "leader-isolate",
+      "what": "leader cut off from the other nodes, still reachable by clients",
+      "topic": "chaos-leader-isolate",
+      "runs": [
+        {
+          "run": 1,
+          "targets": [
+            2
+          ],
+          "leader_before": 2,
+          "leader_after": 3,
+          "term_before": 1,
+          "term_after": 37,
+          "inject_ms": 28.226,
+          "first_write_ms": 5035.092,
+          "new_leader_ms": 216.564,
+          "longest_stall_ms": 5014.719,
+          "whole_again_ms": 264.037,
+          "writes_ok": 209,
+          "writes_failed": 0,
+          "baseline_p50_ms": 34.701,
+          "baseline_p99_ms": 46.524,
+          "fault_p50_ms": 36.113,
+          "fault_p99_ms": 48.913,
+          "seen": true,
+          "evidence": "node 3 led term 2; cut-off node 2 was candidate in term 36"
+        },
+        {
+          "run": 2,
+          "targets": [
+            3
+          ],
+          "leader_before": 3,
+          "leader_after": 1,
+          "term_before": 37,
+          "term_after": 72,
+          "inject_ms": 32.546,
+          "first_write_ms": 5050.394,
+          "new_leader_ms": 245.431,
+          "longest_stall_ms": 5026.524,
+          "whole_again_ms": 493.671,
+          "writes_ok": 213,
+          "writes_failed": 0,
+          "baseline_p50_ms": 36.152,
+          "baseline_p99_ms": 48.934,
+          "fault_p50_ms": 36.905,
+          "fault_p99_ms": 58.716,
+          "seen": true,
+          "evidence": "node 2 led term 38; cut-off node 3 was candidate in term 70"
+        },
+        {
+          "run": 3,
+          "targets": [
+            1
+          ],
+          "leader_before": 1,
+          "leader_after": 2,
+          "term_before": 72,
+          "term_after": 109,
+          "inject_ms": 27.582,
+          "first_write_ms": 5052.883,
+          "new_leader_ms": 236.496,
+          "longest_stall_ms": 5023.488,
+          "whole_again_ms": 419.035,
+          "writes_ok": 213,
+          "writes_failed": 2,
+          "baseline_p50_ms": 45.302,
+          "baseline_p99_ms": 50.725,
+          "fault_p50_ms": 36.171,
+          "fault_p99_ms": 47.629,
+          "seen": true,
+          "evidence": "node 2 led term 73; cut-off node 1 was candidate in term 107"
+        },
+        {
+          "run": 4,
+          "targets": [
+            2
+          ],
+          "leader_before": 2,
+          "leader_after": 1,
+          "term_before": 109,
+          "term_after": 147,
+          "inject_ms": 31.062,
+          "first_write_ms": 5018.829,
+          "new_leader_ms": 476.635,
+          "longest_stall_ms": 5002.399,
+          "whole_again_ms": 308.53,
+          "writes_ok": 215,
+          "writes_failed": 0,
+          "baseline_p50_ms": 36.725,
+          "baseline_p99_ms": 51.393,
+          "fault_p50_ms": 36.087,
+          "fault_p99_ms": 45.34,
+          "seen": true,
+          "evidence": "node 3 led term 111; cut-off node 2 was candidate in term 145"
+        },
+        {
+          "run": 5,
+          "targets": [
+            1
+          ],
+          "leader_before": 1,
+          "leader_after": 3,
+          "term_before": 147,
+          "term_after": 184,
+          "inject_ms": 27.431,
+          "first_write_ms": 5046.374,
+          "new_leader_ms": 1050.615,
+          "longest_stall_ms": 5022.106,
+          "whole_again_ms": 369.784,
+          "writes_ok": 206,
+          "writes_failed": 1,
+          "baseline_p50_ms": 33.848,
+          "baseline_p99_ms": 49.199,
+          "fault_p50_ms": 36.951,
+          "fault_p99_ms": 71.645,
+          "seen": true,
+          "evidence": "node 3 led term 152; cut-off node 1 was candidate in term 182"
+        }
+      ],
+      "contract": {
+        "acknowledged_enqueues": 1928,
+        "lost": 0,
+        "ghosts": 0,
+        "duplicates": 14,
+        "completed": 1928,
+        "unconfirmed_acks": 6,
+        "failed_enqueues": 15,
+        "dead_lettered": 0,
+        "node_enqueued": 1934,
+        "violations": []
+      }
+    }
+  ]
+}

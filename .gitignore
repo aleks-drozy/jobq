@@ -9,6 +9,7 @@
 *.exe
 /jobqd
 /jobq
+/jobqchaos
 /mcp/cmd/jobq-mcp/jobq-mcp
 
 # WAL segment files, in case a data directory ends up somewhere git would

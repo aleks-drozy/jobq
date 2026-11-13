@@ -1,0 +1,158 @@
+{
+  "started": "2026-11-13T20:13:26.100526754Z",
+  "finished": "2026-11-13T20:14:01.651360674Z",
+  "seed": 1794600806100337403,
+  "nodes": 3,
+  "runs_per_fault": 5,
+  "hold_ms": 3000,
+  "settle_ms": 2000,
+  "producers": 3,
+  "consumers": 4,
+  "pace_ms": 5,
+  "faults": [
+    {
+      "fault": "slow-network",
+      "what": "every node's network made slow and lossy",
+      "topic": "chaos-slow-network",
+      "runs": [
+        {
+          "run": 1,
+          "targets": [
+            1,
+            2,
+            3
+          ],
+          "leader_before": 2,
+          "leader_after": 1,
+          "term_before": 1,
+          "term_after": 5,
+          "inject_ms": 67.661,
+          "first_write_ms": 554.181,
+          "new_leader_ms": 5335.646,
+          "longest_stall_ms": 2495.906,
+          "whole_again_ms": 2158.809,
+          "writes_ok": 18,
+          "writes_failed": 0,
+          "baseline_p50_ms": 38.84,
+          "baseline_p99_ms": 49.485,
+          "fault_p50_ms": 520.051,
+          "fault_p99_ms": 2690.642,
+          "seen": true,
+          "evidence": "write p50 38.8ms before, 520.1ms during; term 1 -\u003e 5"
+        },
+        {
+          "run": 2,
+          "targets": [
+            1,
+            2,
+            3
+          ],
+          "leader_before": 1,
+          "leader_after": 1,
+          "term_before": 5,
+          "term_after": 5,
+          "inject_ms": 104.877,
+          "first_write_ms": 551.567,
+          "new_leader_ms": -1,
+          "longest_stall_ms": 910.326,
+          "whole_again_ms": 73.4,
+          "writes_ok": 18,
+          "writes_failed": 0,
+          "baseline_p50_ms": 35.354,
+          "baseline_p99_ms": 49.709,
+          "fault_p50_ms": 402.631,
+          "fault_p99_ms": 1105.734,
+          "seen": true,
+          "evidence": "write p50 35.4ms before, 402.6ms during; term 5 -\u003e 5"
+        },
+        {
+          "run": 3,
+          "targets": [
+            1,
+            2,
+            3
+          ],
+          "leader_before": 1,
+          "leader_after": 1,
+          "term_before": 5,
+          "term_after": 5,
+          "inject_ms": 137.101,
+          "first_write_ms": 969.866,
+          "new_leader_ms": -1,
+          "longest_stall_ms": 632.351,
+          "whole_again_ms": 60.168,
+          "writes_ok": 16,
+          "writes_failed": 0,
+          "baseline_p50_ms": 36.02,
+          "baseline_p99_ms": 66.499,
+          "fault_p50_ms": 396.198,
+          "fault_p99_ms": 923.478,
+          "seen": true,
+          "evidence": "write p50 36ms before, 396.2ms during; term 5 -\u003e 5"
+        },
+        {
+          "run": 4,
+          "targets": [
+            1,
+            2,
+            3
+          ],
+          "leader_before": 1,
+          "leader_after": 1,
+          "term_before": 5,
+          "term_after": 5,
+          "inject_ms": 81.215,
+          "first_write_ms": 940.242,
+          "new_leader_ms": -1,
+          "longest_stall_ms": 520.941,
+          "whole_again_ms": 62.728,
+          "writes_ok": 18,
+          "writes_failed": 0,
+          "baseline_p50_ms": 37.295,
+          "baseline_p99_ms": 43.481,
+          "fault_p50_ms": 396.514,
+          "fault_p99_ms": 909.458,
+          "seen": true,
+          "evidence": "write p50 37.3ms before, 396.5ms during; term 5 -\u003e 5"
+        },
+        {
+          "run": 5,
+          "targets": [
+            1,
+            2,
+            3
+          ],
+          "leader_before": 1,
+          "leader_after": 1,
+          "term_before": 5,
+          "term_after": 5,
+          "inject_ms": 72.106,
+          "first_write_ms": 1163.529,
+          "new_leader_ms": -1,
+          "longest_stall_ms": 744.24,
+          "whole_again_ms": 64.735,
+          "writes_ok": 18,
+          "writes_failed": 0,
+          "baseline_p50_ms": 34.746,
+          "baseline_p99_ms": 42.351,
+          "fault_p50_ms": 396.307,
+          "fault_p99_ms": 592.326,
+          "seen": true,
+          "evidence": "write p50 34.7ms before, 396.3ms during; term 5 -\u003e 5"
+        }
+      ],
+      "contract": {
+        "acknowledged_enqueues": 898,
+        "lost": 0,
+        "ghosts": 0,
+        "duplicates": 2,
+        "completed": 898,
+        "unconfirmed_acks": 0,
+        "failed_enqueues": 0,
+        "dead_lettered": 0,
+        "node_enqueued": 898,
+        "violations": []
+      }
+    }
+  ]
+}
