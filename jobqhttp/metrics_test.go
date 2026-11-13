@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -166,7 +167,8 @@ func TestClientRetryOfALostReplyDoesNotEnqueueTwice(t *testing.T) {
 	c := newHTTPCluster(t)
 	lead := c.leader()
 	real := NewHandler(c.nodes[lead])
-	lost := 0
+	// Counted from the server's goroutine and read from the test's.
+	var lost atomic.Int32
 	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Let the node do the work, then cut the connection before a
 		// byte of the answer goes back.
@@ -175,7 +177,7 @@ func TestClientRetryOfALostReplyDoesNotEnqueueTwice(t *testing.T) {
 		if rec.Code != http.StatusCreated {
 			t.Errorf("the enqueue behind the lost reply got %d", rec.Code)
 		}
-		lost++
+		lost.Add(1)
 		conn, _, err := w.(http.Hijacker).Hijack()
 		if err == nil {
 			conn.Close()
@@ -188,8 +190,8 @@ func TestClientRetryOfALostReplyDoesNotEnqueueTwice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue across a lost reply: %v", err)
 	}
-	if lost != 1 {
-		t.Fatalf("%d replies were lost, want exactly 1", lost)
+	if n := lost.Load(); n != 1 {
+		t.Fatalf("%d replies were lost, want exactly 1", n)
 	}
 	st := c.nodes[lead].Stats("work")
 	if st.Enqueued != 1 {
