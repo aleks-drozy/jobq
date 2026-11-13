@@ -194,6 +194,16 @@ func (m *machine) snapshot() []byte {
 
 // restore replaces the machine with the one a snapshot describes, taken at
 // log index. Readers holding the old queue see it closed.
+// checkSnapshot reports whether restore could load data, without loading
+// it.
+func checkSnapshot(data []byte) error {
+	st, err := decodeState(data)
+	if err != nil {
+		return err
+	}
+	return st.queue.Validate()
+}
+
 func (m *machine) restore(data []byte, index uint64) error {
 	st, err := decodeState(data)
 	if err != nil {

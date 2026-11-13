@@ -3,6 +3,7 @@ package cluster
 import (
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"time"
 
 	"github.com/aleks-drozy/jobq"
@@ -26,6 +27,10 @@ import (
 //	    uvarint  ready jobs, in delivery order, each a job
 //	    uvarint  leases, soonest deadline first, each: job, str lease id,
 //	             time deadline
+//	u32      CRC-32C of everything before it
+//
+// The checksum is there because a snapshot crosses the network between
+// nodes, and a node that installs one gives up its log for it.
 //
 // and a job is:
 //
@@ -69,8 +74,10 @@ func (s state) encode() []byte {
 			b = appendTime(b, l.Deadline)
 		}
 	}
-	return b
+	return binary.LittleEndian.AppendUint32(b, crc32.Checksum(b, castagnoli))
 }
+
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 func appendJob(b []byte, job *jobq.Job) []byte {
 	b = appendBytes(b, []byte(job.ID))
@@ -133,10 +140,14 @@ func (r *reader) job(topic string) *jobq.Job {
 }
 
 func decodeState(b []byte) (state, error) {
-	if len(b) < len(snapshotMagic) || string(b[:len(snapshotMagic)]) != snapshotMagic {
+	if len(b) < len(snapshotMagic)+4 || string(b[:len(snapshotMagic)]) != snapshotMagic {
 		return state{}, errBadSnapshot
 	}
-	r := reader{buf: b[len(snapshotMagic):]}
+	body, sum := b[:len(b)-4], binary.LittleEndian.Uint32(b[len(b)-4:])
+	if crc32.Checksum(body, castagnoli) != sum {
+		return state{}, errBadSnapshot
+	}
+	r := reader{buf: body[len(snapshotMagic):]}
 	var s state
 	s.clock = int64(r.u64())
 	for i, n := 0, r.count(10); i < n && !r.bad; i++ {

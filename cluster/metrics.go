@@ -17,6 +17,11 @@ type Metrics struct {
 	// a snapshot, and one each time a leader sent it one.
 	Snapshots       uint64
 	SnapshotsLoaded uint64
+	// SnapshotsRefused is how many snapshots sent by a leader this node
+	// turned away because they would not load. Anything above zero means
+	// damaged data reached the peer port, or something that is not a node
+	// is talking to it.
+	SnapshotsRefused uint64
 	// LastSnapshotBytes and LastSnapshotTook describe the newest snapshot
 	// this node took. The node does nothing else for that long.
 	LastSnapshotBytes uint64
@@ -47,12 +52,13 @@ var commitBounds = []time.Duration{
 }
 
 type metrics struct {
-	leaderChanges   atomic.Uint64
-	snapshots       atomic.Uint64
-	snapshotsLoaded atomic.Uint64
-	snapshotBytes   atomic.Uint64
-	snapshotNanos   atomic.Uint64
-	commit          histogram
+	leaderChanges    atomic.Uint64
+	snapshots        atomic.Uint64
+	snapshotsLoaded  atomic.Uint64
+	snapshotsRefused atomic.Uint64
+	snapshotBytes    atomic.Uint64
+	snapshotNanos    atomic.Uint64
+	commit           histogram
 }
 
 // histogram counts each observation in the one bucket it falls in; the
@@ -92,6 +98,7 @@ func (n *Node) Metrics() Metrics {
 		LeaderChanges:     n.metrics.leaderChanges.Load(),
 		Snapshots:         n.metrics.snapshots.Load(),
 		SnapshotsLoaded:   n.metrics.snapshotsLoaded.Load(),
+		SnapshotsRefused:  n.metrics.snapshotsRefused.Load(),
 		LastSnapshotBytes: n.metrics.snapshotBytes.Load(),
 		LastSnapshotTook:  time.Duration(n.metrics.snapshotNanos.Load()),
 		DedupedEnqueues:   n.sm.deduped.Load(),

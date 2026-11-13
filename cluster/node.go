@@ -165,6 +165,7 @@ func Start(cfg Config) (*Node, error) {
 		cfg.Transport = nullTransport{}
 	}
 
+	n := &Node{cfg: cfg} // checkSnapshot needs only cfg, and only once running
 	rn, err := raft.New(raft.Config{
 		ID:               cfg.ID,
 		Peers:            cfg.Peers,
@@ -172,11 +173,12 @@ func Start(cfg Config) (*Node, error) {
 		HeartbeatTicks:   cfg.HeartbeatTicks,
 		MaxEntriesPerMsg: cfg.MaxEntriesPerMsg,
 		Storage:          cfg.Storage,
+		CheckSnapshot:    n.checkSnapshot,
 	})
 	if err != nil {
 		return nil, err
 	}
-	n := &Node{
+	*n = Node{
 		cfg:       cfg,
 		rn:        rn,
 		sm:        newMachine(),
@@ -332,6 +334,19 @@ func (n *Node) run() {
 		}
 		n.publish(st)
 	}
+}
+
+// checkSnapshot is asked by the raft node before it installs a snapshot a
+// leader sent. The peer port takes bytes from the network, and installing
+// a snapshot discards the log, so one that would not load is refused here,
+// while refusing still costs nothing.
+func (n *Node) checkSnapshot(s raft.Snapshot) error {
+	err := checkSnapshot(s.Data)
+	if err != nil {
+		n.metrics.snapshotsRefused.Add(1)
+		n.cfg.Logger.Printf("cluster: node %d refused a snapshot at index %d (%d bytes): %v", n.cfg.ID, s.Index, len(s.Data), err)
+	}
+	return err
 }
 
 // fail records why the node is stopping on its own.

@@ -797,3 +797,42 @@ func TestSingleNodeLeaderNeverStepsDown(t *testing.T) {
 		t.Fatalf("single node is %v in term %d, want leader in term 1", n.state, n.term)
 	}
 }
+
+// Installing a snapshot discards the log, so one the state machine could
+// not load must be turned away before anything is written.
+func TestSnapshotThatFailsItsCheckIsNotInstalled(t *testing.T) {
+	st := NewMemoryStorage()
+	n, err := New(Config{ID: 2, Peers: []NodeID{1, 2, 3}, ElectionTicks: testElection, HeartbeatTicks: testBeat,
+		Storage: st, CheckSnapshot: func(s Snapshot) error {
+			if string(s.Data) != "good" {
+				return errors.New("unreadable")
+			}
+			return nil
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustStep(t, n, Message{Type: MsgAppend, From: 1, To: 2, Term: 1, Entries: []Entry{{Index: 1, Term: 1}, {Index: 2, Term: 1}}, Commit: 1})
+	n.Ready()
+
+	mustStep(t, n, Message{Type: MsgSnapshot, From: 1, To: 2, Term: 1, Snapshot: &Snapshot{Index: 9, Term: 1, Data: []byte("garbage")}})
+	rd := n.Ready()
+	if rd.Snapshot != nil {
+		t.Fatal("a snapshot that failed its check was handed to the state machine")
+	}
+	if len(rd.Messages) != 0 {
+		t.Fatalf("a refused snapshot was answered: %+v", rd.Messages)
+	}
+	if n.lastIndex() != 2 || n.commit != 1 || n.snap.Index != 0 {
+		t.Fatalf("node changed: last %d commit %d snapshot %d", n.lastIndex(), n.commit, n.snap.Index)
+	}
+	if _, snap, log, _ := st.Load(); snap.Index != 0 || len(log) != 2 {
+		t.Fatalf("storage changed: snapshot at %d, %d entries", snap.Index, len(log))
+	}
+
+	// A good one from the same leader still goes in.
+	mustStep(t, n, Message{Type: MsgSnapshot, From: 1, To: 2, Term: 1, Snapshot: &Snapshot{Index: 9, Term: 1, Data: []byte("good")}})
+	if rd := n.Ready(); rd.Snapshot == nil || rd.Snapshot.Index != 9 {
+		t.Fatalf("a snapshot that passes its check was not installed: %+v", rd.Snapshot)
+	}
+}

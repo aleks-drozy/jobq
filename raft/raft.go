@@ -171,6 +171,17 @@ type Config struct {
 	// MaxEntriesPerMsg bounds one MsgAppend. Zero means 64.
 	MaxEntriesPerMsg int
 	Storage          Storage
+	// CheckSnapshot, if set, is asked about a snapshot a leader has sent
+	// before the node installs it. An error refuses the snapshot: nothing
+	// is stored, the log is kept, and the leader is not answered, so it
+	// will offer one again later.
+	//
+	// Installing a snapshot throws the node's log away, and the node
+	// cannot tell whether Data is something its state machine can load.
+	// Without this check a snapshot damaged on the way, or sent by
+	// something that is not a leader at all, would be written to disk in
+	// place of the log and leave a node that can never start again.
+	CheckSnapshot func(Snapshot) error
 	// Rand randomizes election timeouts. Nil seeds one from ID.
 	Rand *rand.Rand
 }
@@ -196,6 +207,7 @@ type Node struct {
 	election int
 	beat     int
 	maxBatch int
+	check    func(Snapshot) error
 
 	term     uint64
 	votedFor NodeID
@@ -284,6 +296,7 @@ func New(cfg Config) (*Node, error) {
 		election: cfg.ElectionTicks,
 		beat:     cfg.HeartbeatTicks,
 		maxBatch: cfg.MaxEntriesPerMsg,
+		check:    cfg.CheckSnapshot,
 		term:     hard.Term,
 		votedFor: hard.VotedFor,
 		snap:     snap,
@@ -754,7 +767,11 @@ func (n *Node) handleSnapshot(m Message) error {
 	}
 	// Our log does not reach the snapshot, or disagrees with it there.
 	// Whatever we hold past our commit index came from a leader that lost,
-	// so the whole log goes.
+	// so the whole log goes. That cannot be undone, so the snapshot has to
+	// be one the state machine can load before the log is given up for it.
+	if n.check != nil && n.check(s) != nil {
+		return nil
+	}
 	if err := n.storage.SaveSnapshot(s, nil); err != nil {
 		return n.fail(fmt.Errorf("raft: install snapshot: %w", err))
 	}

@@ -309,3 +309,4 @@ All from `GET /metrics` on each node, Prometheus text format.
 | `jobq_topic_ready`, `jobq_topic_in_flight` | queue depth per topic |
 | `jobq_snapshot_last_duration_seconds` | approaching the election timeout |
 | `jobq_deduplicated_enqueues_total` | climbing means clients are retrying enqueues whose replies they lost |
+| `jobq_snapshots_refused_total` | anything above 0: a snapshot arrived that would not load. Damaged in transit, or something that is not a node can reach port 9090 |

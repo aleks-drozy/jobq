@@ -76,6 +76,17 @@ after the snapshot. Starting empty instead would let it vote as though it
 had never held the entries it acknowledged. The error says so, and the
 runbook says what to do.
 
+**A snapshot from another node is checked before the log is given up for
+it.** Installing a leader's snapshot discards the follower's log, and the
+Raft node cannot tell whether the bytes are something its queue can load.
+So the node asks first (`raft.Config.CheckSnapshot`): the snapshot must
+pass its checksum, decode, and describe a queue that could be built. One
+that does not is refused with nothing written, the log kept, and a counter
+raised. Without that, one damaged message, or one forged one on a peer
+port that authenticates nobody, would be stored in place of the log and
+leave a node that stops every time it is started. An automated security
+review of the first commit pointed this out.
+
 **An enqueue carries a request ID, and the queue remembers it for five
 minutes.** `jobqhttp.Client` puts a random ID on every enqueue and the
 same one on every retry of it. The replicated queue keeps a table of
@@ -217,7 +228,9 @@ compaction; fixed by reusing the empty segment.
 - **An ack whose reply is lost still reports failure.** Request IDs cover
   enqueue only.
 - **A request ID reused after five minutes is a new enqueue.**
-- **No authentication on either port.** As R2.
+- **No authentication on either port.** As R2. A peer that can reach the
+  port can still speak Raft, well-formed snapshots included; the check
+  above stops a snapshot that will not load, not one that lies.
 - **Process kills are not power cuts.** As R2.
 - **Nothing has left loopback.** No latency or throughput figure here
   says anything about a real network. R4.

@@ -72,34 +72,48 @@ func (q *Queue) State() QueueState {
 // back live, with their IDs and deadlines, so a consumer holding one can
 // still settle it.
 func NewFromState(st QueueState, opts ...Option) (*Queue, error) {
+	if err := st.Validate(); err != nil {
+		return nil, err
+	}
 	q := New(opts...)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for i := range st.Topics {
+		if _, err := q.startTopicLocked(st.Topics[i].Name, nil, &st.Topics[i]); err != nil {
+			return nil, closeAfter(q, err)
+		}
+	}
+	return q, nil
+}
+
+// Validate reports whether st is something NewFromState can build a queue
+// from. It starts nothing, so it is the check to make on a state that
+// came from somewhere else before committing to it.
+func (st QueueState) Validate() error {
+	topics := map[string]bool{}
+	for i := range st.Topics {
 		ts := &st.Topics[i]
 		if strings.TrimSpace(ts.Name) == "" {
-			return nil, closeAfter(q, ErrEmptyTopic)
+			return ErrEmptyTopic
 		}
-		if _, dup := q.topics[ts.Name]; dup {
-			return nil, closeAfter(q, fmt.Errorf("jobq: state lists topic %q twice", ts.Name))
+		if topics[ts.Name] {
+			return fmt.Errorf("jobq: state lists topic %q twice", ts.Name)
 		}
+		topics[ts.Name] = true
 		for _, job := range ts.Ready {
 			if job == nil {
-				return nil, closeAfter(q, fmt.Errorf("jobq: state for topic %q has a missing job", ts.Name))
+				return fmt.Errorf("jobq: state for topic %q has a missing job", ts.Name)
 			}
 		}
 		seen := map[string]bool{}
 		for _, l := range ts.Leased {
 			if l.Job == nil || l.LeaseID == "" || seen[l.LeaseID] {
-				return nil, closeAfter(q, fmt.Errorf("jobq: state for topic %q has a bad lease", ts.Name))
+				return fmt.Errorf("jobq: state for topic %q has a bad lease", ts.Name)
 			}
 			seen[l.LeaseID] = true
 		}
-		if _, err := q.startTopicLocked(ts.Name, nil, ts); err != nil {
-			return nil, closeAfter(q, err)
-		}
 	}
-	return q, nil
+	return nil
 }
 
 // closeAfter stops the topics a failed NewFromState already started. The

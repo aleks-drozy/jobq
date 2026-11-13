@@ -378,3 +378,66 @@ func TestNodesSnapshotIndependentlyAndAgree(t *testing.T) {
 		}
 	}
 }
+
+// A snapshot from the network replaces a node's log for good, so one that
+// would not load has to be turned away before it is stored. Otherwise a
+// single damaged message leaves a node that stops, and stops again every
+// time it is started.
+func TestSnapshotThatWouldNotLoadIsRefused(t *testing.T) {
+	c := newTestCluster(t, 3).startAll()
+	lead := c.leader()
+	var victim *Node
+	for _, n := range c.live() {
+		if n.cfg.ID != lead.cfg.ID {
+			victim = n
+		}
+	}
+	for i := 0; i < 10; i++ {
+		mustEnqueue(t, c, "work", fmt.Sprintf("job-%d", i))
+	}
+	c.converged()
+	before := snapshot(victim)
+	term := lead.Status().Term
+
+	// Well-formed and checksummed, but not a queue: one topic, twice.
+	twice := state{queue: jobq.QueueState{Topics: []jobq.TopicState{{Name: "work"}, {Name: "work"}}}}.encode()
+	flipped := sampleState().encode()
+	flipped[len(flipped)/2] ^= 0x01
+	bad := [][]byte{nil, []byte("not a snapshot"), flipped, twice}
+	for _, data := range bad {
+		victim.Step(raft.Message{Type: raft.MsgSnapshot, From: lead.cfg.ID, To: victim.cfg.ID, Term: term,
+			Snapshot: &raft.Snapshot{Index: 1 << 40, Term: term, Data: data}})
+	}
+	eventually(t, "the node to refuse every bad snapshot", func() bool {
+		return victim.Metrics().SnapshotsRefused == uint64(len(bad))
+	})
+
+	select {
+	case <-victim.Done():
+		t.Fatalf("the node stopped: %v", victim.Err())
+	default:
+	}
+	if got := snapshot(victim); got != before {
+		t.Fatalf("a refused snapshot changed the queue.\n--- before\n%s\n--- after\n%s", before, got)
+	}
+	if st := victim.Status(); st.SnapshotIndex >= 1<<40 || st.LastIndex >= 1<<40 {
+		t.Fatalf("a refused snapshot moved the node's log: %+v", st)
+	}
+	// And it is still a working member.
+	mustEnqueue(t, c, "work", "after")
+	c.converged()
+	if got, want := snapshot(victim), snapshot(c.leader()); got != want {
+		t.Fatalf("the node no longer follows the leader.\n%s\n%s", want, got)
+	}
+}
+
+func TestSnapshotChecksumCatchesAFlippedBit(t *testing.T) {
+	good := sampleState().encode()
+	for i := 0; i < len(good); i++ {
+		b := append([]byte(nil), good...)
+		b[i] ^= 0x10
+		if _, err := decodeState(b); err == nil {
+			t.Fatalf("a snapshot with byte %d of %d changed decoded", i, len(good))
+		}
+	}
+}

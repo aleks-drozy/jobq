@@ -115,6 +115,7 @@ func (h *handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 		m.simple("jobq_snapshots_total", "counter", "Snapshots this node has taken of its own queue.", float64(cm.Snapshots))
 		m.simple("jobq_snapshots_loaded_total", "counter", "Snapshots this node has loaded: its own at a restart, or one sent by a leader.", float64(cm.SnapshotsLoaded))
+		m.simple("jobq_snapshots_refused_total", "counter", "Snapshots from a leader this node turned away because they would not load. Should be 0.", float64(cm.SnapshotsRefused))
 		m.simple("jobq_snapshot_last_bytes", "gauge", "Size of the newest snapshot this node took.", float64(cm.LastSnapshotBytes))
 		m.simple("jobq_snapshot_last_duration_seconds", "gauge", "How long the newest snapshot took. The node does nothing else meanwhile.", cm.LastSnapshotTook.Seconds())
 		m.simple("jobq_deduplicated_enqueues_total", "counter", "Enqueues recognised by request ID as already done.", float64(cm.DedupedEnqueues))
