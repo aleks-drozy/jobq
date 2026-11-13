@@ -74,6 +74,10 @@ type testCluster struct {
 	ids     []raft.NodeID
 	stores  map[raft.NodeID]*raft.MemoryStorage
 	timeout time.Duration
+	// Every node snapshots after this many entries and keeps this many
+	// behind. Small by default, so that every test in this file also runs
+	// across snapshots, compaction and catching up from a snapshot.
+	snapEvery, snapKeep int
 
 	mu    sync.Mutex
 	nodes map[raft.NodeID]*Node
@@ -82,12 +86,14 @@ type testCluster struct {
 func newTestCluster(t *testing.T, size int) *testCluster {
 	t.Helper()
 	c := &testCluster{
-		t:       t,
-		net:     newTestNet(),
-		clock:   &testClock{},
-		stores:  map[raft.NodeID]*raft.MemoryStorage{},
-		nodes:   map[raft.NodeID]*Node{},
-		timeout: 5 * time.Second,
+		t:         t,
+		net:       newTestNet(),
+		clock:     &testClock{},
+		stores:    map[raft.NodeID]*raft.MemoryStorage{},
+		nodes:     map[raft.NodeID]*Node{},
+		timeout:   5 * time.Second,
+		snapEvery: 20,
+		snapKeep:  5,
 	}
 	for i := 1; i <= size; i++ {
 		id := raft.NodeID(i)
@@ -120,6 +126,8 @@ func (c *testCluster) start(id raft.NodeID) *Node {
 		ElectionTicks:  10,
 		HeartbeatTicks: 2,
 		Timeout:        c.timeout,
+		SnapshotEvery:  c.snapEvery,
+		SnapshotKeep:   c.snapKeep,
 		Clock:          c.clock.Now,
 		ClientAddr:     func(id raft.NodeID) string { return fmt.Sprintf("node-%d", id) },
 	})
@@ -534,6 +542,18 @@ func TestReplicasEndIdentical(t *testing.T) {
 			t.Fatalf("node %d and node %d disagree.\n--- node %d\n%s\n--- node %d\n%s",
 				nodes[0].cfg.ID, n.cfg.ID, nodes[0].cfg.ID, want, n.cfg.ID, got)
 		}
+	}
+	// The history above crossed many snapshots on every node, and the
+	// restarted follower came back from one.
+	for _, n := range nodes {
+		// Counters start again with the process, so the restarted
+		// follower is held only to having a compacted log.
+		if m := n.Metrics(); (n.cfg.ID != follower && m.Snapshots < 3) || n.Status().FirstIndex <= 1 {
+			t.Fatalf("node %d took %d snapshots and still holds its log from index %d", n.cfg.ID, m.Snapshots, n.Status().FirstIndex)
+		}
+	}
+	if c.node(follower).Metrics().SnapshotsLoaded == 0 {
+		t.Fatal("the restarted follower rebuilt without loading a snapshot")
 	}
 	// Guard against agreeing on nothing.
 	total := jobq.Stats{}

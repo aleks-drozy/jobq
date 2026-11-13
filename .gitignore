@@ -14,3 +14,12 @@
 # WAL segment files, in case a data directory ends up somewhere git would
 # otherwise see it.
 *.seg
+
+# Terraform working files and state. State holds resource IDs and can hold
+# secrets; it stays on the machine that applied it.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+# The linux/arm64 jobqd built for upload (see RUNBOOK.md).
+/deploy/terraform/build/

@@ -16,7 +16,8 @@ an MCP server (`mcp/`, own module, own dependencies, see below) that lets
 an agent enqueue, inspect, and recover a queue through eleven typed tools.
 See `mcp/README.md` and `mcp/demo/` for a real crash, a real recovery, and
 a real MCP client diagnosing it. P4 is the full design deep-dive.
-Replication (three nodes on a from-scratch Raft) is in progress; see below.
+Replication (three nodes on a from-scratch Raft, with snapshots) is built
+and tested on one machine; running it on real ones is next. See below.
 
 ```go
 q, report, _ := jobq.Open("./data", jobq.WithSync(jobq.SyncAlways))
@@ -206,7 +207,8 @@ single node keeps, cluster-wide:
 2. An acked job never comes back.
 
 Delivery is still at-least-once. A change of leader ends every lease, so a
-job in flight at that moment is delivered again.
+job in flight at that moment is delivered again. An enqueue, though,
+happens once: the client names each one, and a retry of it adds nothing.
 
 ```
 # three nodes on one machine (give each its own -dir and ports)
@@ -219,18 +221,31 @@ jobqd -id 1 -dir ./n1 -addr 127.0.0.1:8081 -peer-addr 127.0.0.1:9091 \
 jobq --addr http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 enqueue --payload hi work
 ```
 
-or `docker compose up --build` for the same cluster in containers.
+or `docker compose up --build` for the same cluster in containers, or
+`deploy/terraform` for three EC2 instances across availability zones.
+Neither of those two has been run yet: they were written on a machine with
+no Docker and no Terraform. `RUNBOOK.md` covers bringing the cluster up,
+its one alarm, and what to do when a node is lost.
+
+```
+jobq --addr http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 cluster
+curl -s http://127.0.0.1:8081/metrics
+```
+
+`jobq cluster` asks every node what it believes: who leads, how far its
+log reaches, where its snapshot is. `/metrics` is the Prometheus text
+format, written by hand.
 
 **How it is built.** Four layers, each testable without the one above:
 
 | Layer | What it is |
 |---|---|
 | `raft/` | The Raft algorithm from scratch: election, replication, the commit rule. A node does no I/O and owns no goroutines. |
-| `raftlog.go` | The Raft log on the same CRC-framed write-ahead log the single node uses. One fsync covers a whole batch of proposals. |
-| `cluster/` | The driver that owns the timer, network and disk, and the state machine: an ordinary in-memory `jobq.Queue` fed only by committed log entries. |
+| `raftlog.go` | The Raft log on the same CRC-framed write-ahead log the single node uses. One fsync covers a whole batch of proposals. Compaction replaces the log with a snapshot and its last few thousand entries, atomically. |
+| `cluster/` | The driver that owns the timer, network and disk, and the state machine: an ordinary in-memory `jobq.Queue` fed only by committed log entries, which can be snapshotted and rebuilt. |
 | `jobqhttp`, `jobqd` | The same HTTP API as a single node. A follower answers `421 not_leader` with the leader's address; the client follows it. |
 
-**Three decisions worth knowing.**
+**Five decisions worth knowing.**
 
 - *Every change goes through the log, `Dequeue` included.* Handing out a
   lease changes state. A leader cut off from the cluster still believes it
@@ -244,13 +259,23 @@ or `docker compose up --build` for the same cluster in containers.
 - *A change of leader ends every lease*, the same rule a single node applies
   on restart. Consumers already handle a lease timing out, and lease
   deadlines never have to be compared across two machines' clocks.
+- *A snapshot is the queue's whole state, live leases included.* Each node
+  snapshots on its own schedule, so a node that restored from a snapshot
+  must be indistinguishable from one that replayed the log past the same
+  point. The test is that property: a queue replaced by a copy of itself
+  at random moments must end identical to one that never was.
+- *An enqueue carries a request ID that the queue remembers for five
+  minutes.* The table of recent IDs is replicated state like any other: it
+  is in the snapshot, and it is forgotten by the leaders' timestamps while
+  applying a log entry, so every node drops the same ID at the same point.
 
 **How it is tested.**
 
 - `raft/`: a seeded simulator drives whole clusters through dropped,
   duplicated and reordered messages, crashes, restarts, partitions and slow
   clocks, and checks the Raft safety properties after every step. 10,000
-  seeds run clean under the race detector. It also plants three real Raft
+  seeds run clean. Nodes compact their logs at random, so followers are
+  caught up by snapshot as well as by log. It also plants four real Raft
   bugs one at a time and must catch each.
 
   ```
@@ -258,33 +283,50 @@ or `docker compose up --build` for the same cluster in containers.
   ```
 - `cluster/`: three nodes in one process. A 500-step random history, with a
   follower restarted halfway, must leave all three holding identical queues
-  down to job IDs and lease order. The conservation property runs under
-  concurrent producers and consumers while the leader is shut down four
-  times.
+  down to job IDs and lease order, with every node snapshotting every 20
+  entries. The conservation property runs under concurrent producers and
+  consumers while the leader is shut down four times. The two recovery
+  procedures in the runbook (a node replaced with an empty disk; the whole
+  cluster restored from one node's disk) each have a test.
 - `cmd/jobqd`: the cluster crash harness. Three real `jobqd` processes with
   real disks and real HTTP between them; the test kills the leader cold
-  three times, then all three nodes at once, while clients keep working.
-  Across 15 consecutive runs on a Windows laptop: 20,117 acknowledged
-  enqueues, 45 leader kills, 15 whole-cluster kills, 0 lost, 0 acked jobs
-  delivered again.
+  three times, then all three nodes at once, while clients keep working
+  and every node snapshots every 300 entries. Across 15 consecutive runs
+  on a Windows laptop: 19,912 acknowledged enqueues, 45 leader kills, 15
+  whole-cluster kills, 549 snapshots taken and 101 loaded, 0 lost, 0 acked
+  jobs delivered again, 0 enqueued twice.
 
   ```
   go test ./cmd/jobqd -run TestClusterLosesNothing -v
   ```
 
-**What this does not do yet.** The log is never compacted: it grows forever
-and a restarted node replays all of it (snapshots are next). A client that
-retries after a lost reply can enqueue a job twice (request IDs are next).
-Membership is fixed. Reads (`stats`, `peek`) come from whichever node you
-ask and can be stale. There is no authentication on either port, so the
-peer port must be reachable only by the other nodes. Killing a process is
-not cutting the power: these tests do not prove fsync is honoured by the
-disk. Nothing here has been measured for speed, and it has run only on
-loopback, never across machines.
+**What snapshots buy**, measured once on that laptop with 500,000 jobs
+through one durable node, 50,000 of them still queued at the end:
 
-See `docs/specs/2026-11-11-jobq-r1-raft.md` and
-`docs/specs/2026-11-12-jobq-r2-replicated-queue.md` for the designs, the
-numbers, and how far to trust them.
+| | No snapshots | Snapshot every 16,384 entries |
+|---|---|---|
+| Log on disk | 209.2 MB | 1.6 MB |
+| Snapshot on disk | none | 16.5 MB |
+| Restart until serving | 9.12 s | 0.11 s |
+
+and what they cost: taking that snapshot stopped the node for 99 ms.
+
+**What this does not do yet.** It has run only on loopback, never across
+machines, and the Docker and AWS files have never been run at all. A
+snapshot stops the node that takes it until it is on disk, and is sent to
+a follower as one message, so this design does not suit a queue holding
+gigabytes. Membership is fixed: replacing a dead node is a manual
+procedure with a check the operator must make. There are no backups.
+Reads (`stats`, `peek`) come from whichever node you ask and can be stale.
+There is no authentication on either port, so the peer port must be
+reachable only by the other nodes. Killing a process is not cutting the
+power: these tests do not prove fsync is honoured by the disk. Nothing
+here says how fast it is over a real network.
+
+See `docs/specs/2026-11-11-jobq-r1-raft.md`,
+`docs/specs/2026-11-12-jobq-r2-replicated-queue.md` and
+`docs/specs/2026-11-13-jobq-r3-snapshots.md` for the designs, the numbers,
+and how far to trust them.
 
 ## Not in v1
 

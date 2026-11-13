@@ -23,6 +23,7 @@ var sentinelTable = []struct {
 	{jobq.ErrEmptyTopic, http.StatusBadRequest, "empty_topic"},
 	{jobq.ErrReservedTopic, http.StatusBadRequest, "reserved_topic"},
 	{jobq.ErrNonPositiveDuration, http.StatusBadRequest, "non_positive_duration"},
+	{jobq.ErrRequestIDTooLong, http.StatusBadRequest, "request_id_too_long"},
 	{jobq.ErrClosed, http.StatusServiceUnavailable, "closed"},
 	// 421 Misdirected Request: the request was fine, it went to a node
 	// that cannot act on it. Nothing was applied.

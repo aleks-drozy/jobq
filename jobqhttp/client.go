@@ -3,6 +3,8 @@ package jobqhttp
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,11 +30,12 @@ import (
 // cannot be reached. It keeps trying for the retry budget (default 10s),
 // which is what carries a caller across a change of leader.
 //
-// Two things follow from retrying, and both are within at-least-once. A
-// request that failed in transit may have been applied before the retry
-// applies it again, so an enqueue can land twice. And an ack that was
-// applied before its reply was lost comes back from the retry as
-// jobq.ErrUnknownLease: the job is settled even though the call failed.
+// A request that failed in transit may have been applied before the retry
+// reaches another node. For an enqueue that is harmless: each one carries
+// a request ID (see jobq.WithRequestID) and a replicated queue adds the
+// job once however many times it arrives. For an ack it shows: one that
+// was applied before its reply was lost comes back from the retry as
+// jobq.ErrUnknownLease. The job is settled even though the call failed.
 type Client struct {
 	addrs []string
 	httpc *http.Client
@@ -127,12 +130,34 @@ func (c *Client) Enqueue(topic string, payload []byte, opts ...jobq.EnqueueOptio
 	for _, opt := range opts {
 		opt(&o)
 	}
+	if len(o.RequestID) > jobq.MaxRequestIDLen {
+		return "", jobq.ErrRequestIDTooLong
+	}
+	// Every enqueue carries a request ID, the caller's or a fresh random
+	// one, and every retry of it carries the same one. That is what makes
+	// retrying safe: a replicated queue that already has the job answers
+	// with it instead of adding another.
+	id := o.RequestID
+	if id == "" {
+		id = newRequestID()
+	}
 	req := enqueueJSONRequest{Payload: payload, DelayMs: ms(o.Delay), MaxAttempts: o.MaxAttempts}
 	var resp enqueueResponseDTO
-	if err := c.doJSON(context.Background(), http.MethodPost, "/v1/topics/"+url.PathEscape(topic)+"/jobs", req, &resp, http.StatusCreated); err != nil {
+	ctx := context.WithValue(context.Background(), requestIDKey{}, id)
+	if err := c.doJSON(ctx, http.MethodPost, "/v1/topics/"+url.PathEscape(topic)+"/jobs", req, &resp, http.StatusCreated); err != nil {
 		return "", err
 	}
 	return resp.ID, nil
+}
+
+type requestIDKey struct{}
+
+func newRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("jobqhttp: crypto/rand failed: " + err.Error())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // Dequeue implements jobq.Client: a single, non-blocking attempt — it never
@@ -408,6 +433,9 @@ func (c *Client) once(ctx context.Context, base, method, path string, body []byt
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if id, ok := ctx.Value(requestIDKey{}).(string); ok {
+		req.Header.Set(RequestIDHeader, id)
 	}
 	resp, err := c.httpc.Do(req)
 	if err != nil {

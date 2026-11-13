@@ -45,6 +45,9 @@ func TestMessageRoundTrip(t *testing.T) {
 			{Index: 42, Term: 9, Data: []byte("a command")},
 		}},
 		{Type: raft.MsgAppendResp, From: 3, To: 1, Term: 9, LogIndex: 40, Reject: true, Hint: 12},
+		{Type: raft.MsgSnapshot, From: 1, To: 3, Term: 9, Snapshot: &raft.Snapshot{Index: 40, Term: 8, Data: []byte("the whole queue")}},
+		// A message after the snapshot shows its length was honoured.
+		{Type: raft.MsgAppend, From: 1, To: 3, Term: 9, LogIndex: 40, LogTerm: 8},
 	}
 	var batch []byte
 	for _, m := range cases {

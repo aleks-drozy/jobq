@@ -112,6 +112,8 @@ func mainRun(args []string, stdout, stderr io.Writer) int {
 		return cmdRecovery(&g, rest, newClient, stdout, stderr)
 	case "work":
 		return cmdWork(&g, rest, newClient, stdout, stderr)
+	case "cluster":
+		return cmdCluster(&g, rest, stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, usage)
 		return exitOK
@@ -135,10 +137,13 @@ Flags come before positional arguments (stdlib flag package, not getopt):
   jobq topics
   jobq health
   jobq recovery
+  jobq cluster
   jobq work    [--visibility 30s] [--wait 20s] [--max-jobs N] <topic> -- <cmd> [args...]
 
 --addr defaults to $JOBQ_ADDR or http://127.0.0.1:8080. For a cluster, give
 every node separated by commas; the leader is found and followed for you.
+"jobq cluster" is the exception: it asks each node in turn what it believes
+and exits 1 unless the ones that answer agree on a leader that answered.
 --addr/--timeout/--json may appear before or after the subcommand name, but
 still before <topic>.
 Exit codes: 0 ok, 1 error, 2 usage, 3 no job available.`

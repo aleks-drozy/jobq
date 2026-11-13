@@ -150,6 +150,22 @@ func WithDelay(d time.Duration) EnqueueOption {
 	return func(o *EnqueueOptions) { o.Delay = d }
 }
 
+// WithRequestID names an enqueue so that a retry of it does not add a
+// second job. A replicated queue remembers each request ID for a few
+// minutes (cluster.DedupWindow of the queue's own clock); a second enqueue
+// carrying the same ID inside that window adds nothing and returns the
+// first one's job ID. jobqhttp.Client sets one on every enqueue, which is
+// what lets it retry an enqueue whose reply was lost.
+//
+// This makes the enqueue happen once. Delivery is still at-least-once.
+//
+// A single-node Queue ignores it: it has no retrying client in front of it
+// and does not keep the table. An ID longer than MaxRequestIDLen is
+// refused with ErrRequestIDTooLong by a replicated queue.
+func WithRequestID(id string) EnqueueOption {
+	return func(o *EnqueueOptions) { o.RequestID = id }
+}
+
 // WithMaxAttempts overrides DefaultMaxAttempts for this job.
 func WithMaxAttempts(n int) EnqueueOption {
 	return func(o *EnqueueOptions) { o.MaxAttempts = n }
@@ -383,6 +399,10 @@ func (q *Queue) makeTopic(name string, initial []*Job) (*topic, error) {
 // makeTopicLocked assigns the topic's WAL identity (logging a TOPIC record
 // on first assignment) and starts its actor. Caller holds q.mu.
 func (q *Queue) makeTopicLocked(name string, initial []*Job) (*topic, error) {
+	return q.startTopicLocked(name, initial, nil)
+}
+
+func (q *Queue) startTopicLocked(name string, initial []*Job, restore *TopicState) (*topic, error) {
 	var logRec func(walRecord, bool) waiter
 	var id uint32
 	if q.wal != nil {
@@ -404,6 +424,7 @@ func (q *Queue) makeTopicLocked(name string, initial []*Job) (*topic, error) {
 		logRec:     logRec,
 		walID:      id,
 		initial:    initial,
+		restore:    restore,
 		newID:      q.newID,
 		passive:    q.passive,
 	})

@@ -55,6 +55,8 @@ type config struct {
 	advertise string
 	peerAddr  string
 	tick      time.Duration
+	snapEvery int
+	snapKeep  int
 }
 
 func parseFlags(args []string) (config, error) {
@@ -73,6 +75,8 @@ func parseFlags(args []string) (config, error) {
 	fs.StringVar(&c.advertise, "advertise", "", "cluster mode: every node's client URL in the same form, so a follower can tell a client where the leader is")
 	fs.StringVar(&c.peerAddr, "peer-addr", "127.0.0.1:9090", "cluster mode: listen address for other nodes (no auth: must not be reachable by anyone else)")
 	fs.DurationVar(&c.tick, "tick", 10*time.Millisecond, "cluster mode: Raft tick; elections fire after 15 to 30 ticks of silence, heartbeats every 3")
+	fs.IntVar(&c.snapEvery, "snapshot-every", 0, "cluster mode: snapshot the queue and drop the log behind it after this many entries (0 = 16384, negative = never: the log then grows without bound)")
+	fs.IntVar(&c.snapKeep, "snapshot-keep", 0, "cluster mode: log entries to keep behind a snapshot so a briefly absent node catches up from the log (0 = a quarter of -snapshot-every)")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}

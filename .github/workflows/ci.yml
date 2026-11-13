@@ -30,6 +30,27 @@ jobs:
             exit 1
           fi
 
+  # The Terraform was written without a Terraform binary to hand. This is
+  # the only place it is checked at all, and it checks syntax and types,
+  # not that it builds what it claims: nothing here touches AWS.
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+      - name: fmt
+        run: terraform fmt -check -recursive -diff deploy/terraform
+      - name: validate cluster
+        working-directory: deploy/terraform
+        # main.tf hashes the jobqd binary it uploads; give it one to find.
+        run: |
+          mkdir -p build && : > build/jobqd
+          terraform init -backend=false -input=false
+          terraform validate
+      - name: validate budget
+        working-directory: deploy/terraform/budget
+        run: terraform init -backend=false -input=false && terraform validate
+
   mcp:
     runs-on: ubuntu-latest
     defaults:

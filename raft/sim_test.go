@@ -13,9 +13,16 @@ package raft
 // of the Raft paper against a record of everything any node has ever
 // claimed. After the chaos it heals the cluster and requires it to make
 // progress, so a run cannot pass by electing nobody and committing nothing.
+//
+// Nodes also compact their logs at random, each on its own schedule, so
+// followers are caught up by snapshot as well as by log. The state machine
+// the simulator models is a running hash of every applied entry, which
+// makes a snapshot's contents checkable: the state after index i has
+// exactly one right value.
 
 import (
 	"bytes"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -59,6 +66,8 @@ type simConfig struct {
 	partitionP float64 // per step
 	healP      float64 // per step
 	proposeP   float64 // per step
+	compactP   float64 // per step: one live node compacts its log
+	maxKeep    int     // entries a compaction may keep behind its snapshot
 }
 
 func defaultSimConfig(seed int64) simConfig {
@@ -76,6 +85,8 @@ func defaultSimConfig(seed int64) simConfig {
 		partitionP: 0.012,
 		healP:      0.03,
 		proposeP:   0.30,
+		compactP:   0.05,
+		maxKeep:    3,
 	}
 }
 
@@ -91,6 +102,9 @@ type simStats struct {
 	duplicated  int
 	delivered   int
 	multiLeader int // runs that saw more than one leader term
+	compactions int
+	installs    int // snapshots a node loaded from its leader
+	restores    int // snapshots a node loaded from its own storage on restart
 }
 
 func (a *simStats) add(b simStats) {
@@ -105,6 +119,9 @@ func (a *simStats) add(b simStats) {
 	a.duplicated += b.duplicated
 	a.delivered += b.delivered
 	a.multiLeader += b.multiLeader
+	a.compactions += b.compactions
+	a.installs += b.installs
+	a.restores += b.restores
 }
 
 type envelope struct {
@@ -124,12 +141,15 @@ type sim struct {
 	stores   map[NodeID]*MemoryStorage
 	boots    map[NodeID]int
 	applied  map[NodeID]uint64 // highest index applied since the node's last start
+	state    map[NodeID]uint64 // each node's state machine: a hash of what it applied
+	fresh    map[NodeID]bool   // started, and not yet asked for its first Ready
 	inflight []envelope
 	cut      map[link]bool
 
 	// The record every claim is checked against.
 	leaders   map[uint64]NodeID // term -> the one node allowed to lead it
 	committed []Entry           // committed[i] has Index i+1
+	hashes    []uint64          // hashes[i] is the state after applying index i
 
 	proposed int
 	chaos    bool
@@ -144,8 +164,11 @@ func newSim(cfg simConfig) (*sim, error) {
 		stores:  map[NodeID]*MemoryStorage{},
 		boots:   map[NodeID]int{},
 		applied: map[NodeID]uint64{},
+		state:   map[NodeID]uint64{},
+		fresh:   map[NodeID]bool{},
 		cut:     map[link]bool{},
 		leaders: map[uint64]NodeID{},
+		hashes:  []uint64{emptyState},
 		chaos:   true,
 	}
 	for i := 1; i <= cfg.nodes; i++ {
@@ -184,7 +207,52 @@ func (s *sim) start(id NodeID) error {
 	n.faults = s.cfg.faults
 	s.nodes[id] = n
 	s.applied[id] = 0
+	s.state[id] = emptyState
+	s.fresh[id] = true
 	return nil
+}
+
+const emptyState uint64 = 0x9e3779b97f4a7c15
+
+// mix folds one applied entry into a state. Order matters and every field
+// counts, so two nodes agree on a state only if they applied the same
+// entries in the same order.
+func mix(state uint64, e Entry) uint64 {
+	h := state ^ e.Index*0xff51afd7ed558ccd ^ e.Term*0xc4ceb9fe1a85ec53 ^ uint64(e.Kind)<<56
+	for _, b := range e.Data {
+		h = (h ^ uint64(b)) * 0x100000001b3
+	}
+	h ^= h >> 29
+	return h * 0xbf58476d1ce4e5b9
+}
+
+func encodeState(h uint64) []byte { return binary.LittleEndian.AppendUint64(nil, h) }
+
+// checkSnapshot holds a snapshot, wherever it was found, against the
+// record: it must cover only committed entries and contain exactly the
+// state those entries produce.
+func (s *sim) checkSnapshot(where string, snap Snapshot) error {
+	if snap.Index == 0 {
+		return nil
+	}
+	if snap.Index > uint64(len(s.committed)) {
+		return violated("state machine safety", "%s has a snapshot at index %d, record ends at %d", where, snap.Index, len(s.committed))
+	}
+	if want := s.committed[snap.Index-1].Term; snap.Term != want {
+		return violated("state machine safety", "%s has a snapshot at index %d of term %d, record says term %d", where, snap.Index, snap.Term, want)
+	}
+	if !bytes.Equal(snap.Data, encodeState(s.hashes[snap.Index])) {
+		return violated("state machine safety", "%s has a snapshot at index %d holding the wrong state", where, snap.Index)
+	}
+	return nil
+}
+
+// entryAt returns the entry a node holds at index, if it still holds it.
+func entryAt(log []Entry, index uint64) (Entry, bool) {
+	if len(log) == 0 || index < log[0].Index || index > log[len(log)-1].Index {
+		return Entry{}, false
+	}
+	return log[index-log[0].Index], true
 }
 
 // ids0 is the full membership, which must be known before every node has
@@ -326,13 +394,57 @@ func (s *sim) step() error {
 			return err
 		}
 	}
+	if s.chaos && s.rng.Float64() < s.cfg.compactP {
+		if err := s.compact(); err != nil {
+			return err
+		}
+	}
 	return s.checkLeaders()
+}
+
+// compact has one live node snapshot its state machine somewhere in what
+// it has applied since its last snapshot, keeping a few entries behind.
+func (s *sim) compact() error {
+	live := s.live()
+	if len(live) == 0 {
+		return nil
+	}
+	id := live[s.rng.Intn(len(live))]
+	n := s.nodes[id]
+	keep := s.rng.Intn(s.cfg.maxKeep + 1)
+	span := s.applied[id] - n.snap.Index
+	if s.applied[id] <= n.snap.Index {
+		return nil
+	}
+	index := n.snap.Index + 1 + uint64(s.rng.Int63n(int64(span)))
+	s.tracef("node %d compacts at index %d keeping %d", id, index, keep)
+	s.stats.compactions++
+	return n.Compact(index, encodeState(s.hashes[index]), keep)
 }
 
 // collect takes a node's output: committed entries go to the global record,
 // messages go to the network to be lost, delayed and duplicated.
 func (s *sim) collect(id NodeID) error {
 	rd := s.nodes[id].Ready()
+	if snap := rd.Snapshot; snap != nil {
+		// A snapshot replaces the state machine. It may only move a node
+		// forwards: loading one from behind would un-apply entries.
+		if snap.Index < s.applied[id] {
+			return violated("apply order", "node %d loaded a snapshot at index %d after applying %d", id, snap.Index, s.applied[id])
+		}
+		if err := s.checkSnapshot(fmt.Sprintf("node %d", id), *snap); err != nil {
+			return err
+		}
+		if s.fresh[id] {
+			s.stats.restores++
+		} else {
+			s.stats.installs++
+			s.tracef("node %d installs a snapshot at index %d", id, snap.Index)
+		}
+		s.applied[id] = snap.Index
+		s.state[id] = s.hashes[snap.Index]
+	}
+	s.fresh[id] = false
 	for _, e := range rd.Committed {
 		if e.Index != s.applied[id]+1 {
 			return violated("apply order", "node %d applied index %d after %d", id, e.Index, s.applied[id])
@@ -346,9 +458,14 @@ func (s *sim) collect(id NodeID) error {
 			}
 		case e.Index == uint64(len(s.committed))+1:
 			s.committed = append(s.committed, e)
+			s.hashes = append(s.hashes, mix(s.hashes[e.Index-1], e))
 			s.stats.committed++
 		default:
 			return violated("apply order", "node %d applied index %d, record ends at %d", id, e.Index, len(s.committed))
+		}
+		s.state[id] = mix(s.state[id], e)
+		if s.state[id] != s.hashes[e.Index] {
+			return violated("state machine safety", "node %d reached a different state at index %d", id, e.Index)
 		}
 	}
 	for _, m := range rd.Messages {
@@ -387,8 +504,15 @@ func (s *sim) checkLeaders() error {
 		s.leaders[n.term] = id
 		s.stats.elections++
 		s.tracef("node %d leads term %d (log %d, committed record %d)", id, n.term, len(n.log), len(s.committed))
+		if err := s.checkSnapshot(fmt.Sprintf("node %d", id), n.snap); err != nil {
+			return err
+		}
 		for _, c := range s.committed {
-			if c.Index > uint64(len(n.log)) || !sameEntry(n.log[c.Index-1], c) {
+			have, ok := entryAt(n.log, c.Index)
+			if !ok && c.Index <= n.snap.Index {
+				continue // inside its snapshot, which was just checked
+			}
+			if !ok || !sameEntry(have, c) {
 				return violated("leader completeness",
 					"node %d won term %d without committed entry %s", id, n.term, show(c))
 			}
@@ -405,27 +529,46 @@ func (s *sim) checkLogs() error {
 		la := s.stores[a].entries
 		for _, b := range s.ids[i+1:] {
 			lb := s.stores[b].entries
-			for k := min(len(la), len(lb)) - 1; k >= 0; k-- {
-				if la[k].Term != lb[k].Term {
+			if len(la) == 0 || len(lb) == 0 {
+				continue
+			}
+			// Only the stretch of indexes both still hold can be compared.
+			lo := max(la[0].Index, lb[0].Index)
+			hi := min(la[len(la)-1].Index, lb[len(lb)-1].Index)
+			for k := hi; k >= lo; k-- {
+				ea, _ := entryAt(la, k)
+				eb, _ := entryAt(lb, k)
+				if ea.Term != eb.Term {
 					continue
 				}
 				// Same index and term: everything up to here must agree.
-				for j := 0; j <= k; j++ {
-					if !sameEntry(la[j], lb[j]) {
+				for j := lo; j <= k; j++ {
+					ja, _ := entryAt(la, j)
+					jb, _ := entryAt(lb, j)
+					if !sameEntry(ja, jb) {
 						return violated("log matching",
 							"nodes %d and %d agree on term %d at index %d but differ at index %d: %s vs %s",
-							a, b, la[k].Term, k+1, j+1, show(la[j]), show(lb[j]))
+							a, b, ea.Term, k, j, show(ja), show(jb))
 					}
 				}
 				break
 			}
 		}
 	}
+	for _, id := range s.ids {
+		// Crashed nodes included: what is on disk must be right too.
+		if err := s.checkSnapshot(fmt.Sprintf("node %d's storage", id), s.stores[id].snap); err != nil {
+			return err
+		}
+	}
 	for _, id := range s.live() {
 		n := s.nodes[id]
-		for k := uint64(0); k < n.commit; k++ {
-			if k >= uint64(len(s.committed)) || !sameEntry(n.log[k], s.committed[k]) {
-				return violated("state machine safety", "node %d holds a committed prefix that differs from the record at index %d", id, k+1)
+		if n.commit > uint64(len(s.committed)) {
+			return violated("state machine safety", "node %d has commit index %d, record ends at %d", id, n.commit, len(s.committed))
+		}
+		for k := n.firstIndex(); k <= n.commit; k++ {
+			if have, _ := entryAt(n.log, k); !sameEntry(have, s.committed[k-1]) {
+				return violated("state machine safety", "node %d holds a committed prefix that differs from the record at index %d", id, k)
 			}
 		}
 	}
@@ -485,7 +628,7 @@ func (s *sim) converge() error {
 		}
 		done := true
 		for _, id := range s.ids {
-			if s.applied[id] != uint64(len(s.committed)) || len(s.stores[id].entries) != len(s.committed) {
+			if s.applied[id] != uint64(len(s.committed)) || s.stores[id].lastIndex() != uint64(len(s.committed)) {
 				done = false
 			}
 		}
@@ -528,10 +671,13 @@ func runSim(cfg simConfig) (simStats, error) {
 	// Every node ended with the same log and applied all of it, so the
 	// applied sequences are identical; say so explicitly.
 	for _, id := range s.ids {
-		for k, e := range s.stores[id].entries {
-			if !sameEntry(e, s.committed[k]) {
-				return s.stats, violated("state machine safety", "node %d final log differs from the record at index %d", id, k+1)
+		for _, e := range s.stores[id].entries {
+			if !sameEntry(e, s.committed[e.Index-1]) {
+				return s.stats, violated("state machine safety", "node %d final log differs from the record at index %d", id, e.Index)
 			}
+		}
+		if s.state[id] != s.hashes[len(s.committed)] {
+			return s.stats, violated("state machine safety", "node %d ended in a different state from the record", id)
 		}
 	}
 	s.stats.runs = 1
@@ -584,9 +730,10 @@ func TestSimulation(t *testing.T) {
 		return
 	}
 
-	t.Logf("%d runs: %d leaders elected, %d entries committed of %d proposed, %d crashes, %d restarts, %d partitions, %d messages delivered, %d dropped, %d duplicated, %d runs with a leader change",
+	t.Logf("%d runs: %d leaders elected, %d entries committed of %d proposed, %d crashes, %d restarts, %d partitions, %d messages delivered, %d dropped, %d duplicated, %d runs with a leader change, %d compactions, %d snapshots installed from a leader, %d restarts from a snapshot",
 		total.runs, total.elections, total.committed, total.proposals, total.crashes, total.restarts,
-		total.partitions, total.delivered, total.dropped, total.duplicated, total.multiLeader)
+		total.partitions, total.delivered, total.dropped, total.duplicated, total.multiLeader,
+		total.compactions, total.installs, total.restores)
 
 	// A suite that never crashed a node or changed a leader proved nothing.
 	if total.runs != sims {
@@ -596,6 +743,9 @@ func TestSimulation(t *testing.T) {
 		"crashes": total.crashes, "restarts": total.restarts, "partitions": total.partitions,
 		"dropped messages": total.dropped, "duplicated messages": total.duplicated,
 		"runs with a leader change": total.multiLeader,
+		"compactions":               total.compactions,
+		"snapshots installed":       total.installs,
+		"restarts from a snapshot":  total.restores,
 	} {
 		if n < sims/10 {
 			t.Errorf("only %d %s across %d runs: the simulator is not exercising that fault", n, name, sims)
@@ -640,13 +790,17 @@ func TestSimulationCatchesBrokenRaft(t *testing.T) {
 		first  int64    // a seed known to expose it, tried before scanning
 		want   []string // any of these properties
 	}{
-		{"votes twice in one term", faults{doubleVote: true}, nil, 1, []string{"election safety"}},
-		{"votes for a stale log", faults{voteForStaleLog: true}, nil, 3, []string{"leader completeness", "state machine safety", "log matching"}},
+		{"votes twice in one term", faults{doubleVote: true}, nil, 2, []string{"election safety"}},
+		{"votes for a stale log", faults{voteForStaleLog: true}, nil, 1, []string{"leader completeness", "state machine safety", "log matching"}},
 		// Figure 8 needs a leader to die between committing an inherited
 		// entry and replicating anything of its own, then lose the next
 		// election to a node that never saw that entry. One entry per
 		// message and frequent crashes make that window wide enough to hit.
-		{"commits an old-term entry by counting", faults{commitOldTerm: true}, figure8Weather, 3453, []string{"leader completeness", "state machine safety", "log matching"}},
+		{"commits an old-term entry by counting", faults{commitOldTerm: true}, figure8Weather, 6446, []string{"leader completeness", "state machine safety", "log matching"}},
+		// A snapshot is sent, the follower catches up past it some other
+		// way, and then the snapshot arrives late or twice. Installing it
+		// throws away committed entries.
+		{"installs a snapshot behind its commit index", faults{installStale: true}, nil, 22, []string{"apply order", "leader completeness", "state machine safety", "log matching"}},
 	}
 	const maxSeeds = 20000
 	for _, tc := range cases {

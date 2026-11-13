@@ -39,6 +39,7 @@ var (
 type clusterBackend interface {
 	Status() cluster.Status
 	LeaderAddr() string
+	Metrics() cluster.Metrics
 }
 
 const (
@@ -61,6 +62,7 @@ type handlerOptions struct {
 	dir          string
 	sync         string
 	startedAt    time.Time
+	diskUsage    func() (logBytes, snapshotBytes int64)
 }
 
 // HandlerOption configures NewHandler.
@@ -105,6 +107,12 @@ func WithRecovery(report jobq.RecoveryReport, dir, sync string) HandlerOption {
 	}
 }
 
+// WithDiskUsage lets GET /metrics report how much disk a replicated node's
+// log and snapshot take; pass (*jobq.RaftLog).DiskUsage.
+func WithDiskUsage(f func() (logBytes, snapshotBytes int64)) HandlerOption {
+	return func(o *handlerOptions) { o.diskUsage = f }
+}
+
 type handler struct {
 	q    Backend
 	opts handlerOptions
@@ -139,6 +147,7 @@ func NewHandler(q Backend, opts ...HandlerOption) http.Handler {
 	mux.HandleFunc("GET /v1/health", h.handleHealth)
 	mux.HandleFunc("GET /v1/recovery", h.handleRecovery)
 	mux.HandleFunc("GET /v1/cluster", h.handleCluster)
+	mux.HandleFunc("GET /metrics", h.handleMetrics)
 	return mux
 }
 
@@ -184,14 +193,16 @@ func (h *handler) handleCluster(w http.ResponseWriter, r *http.Request) {
 	}
 	st := cb.Status()
 	writeJSON(w, http.StatusOK, ClusterStatus{
-		ID:         uint64(st.ID),
-		State:      st.State.String(),
-		Term:       st.Term,
-		Leader:     uint64(st.Leader),
-		LeaderAddr: cb.LeaderAddr(),
-		Commit:     st.Commit,
-		Applied:    st.Applied,
-		LastIndex:  st.LastIndex,
+		ID:            uint64(st.ID),
+		State:         st.State.String(),
+		Term:          st.Term,
+		Leader:        uint64(st.Leader),
+		LeaderAddr:    cb.LeaderAddr(),
+		Commit:        st.Commit,
+		Applied:       st.Applied,
+		LastIndex:     st.LastIndex,
+		SnapshotIndex: st.SnapshotIndex,
+		FirstIndex:    st.FirstIndex,
 	})
 }
 
@@ -413,6 +424,16 @@ func (h *handler) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	}
 	if maxAttempts > 0 {
 		opts = append(opts, jobq.WithMaxAttempts(maxAttempts))
+	}
+	// A request ID travels in a header so that it works for both body
+	// forms. A replicated node uses it to make a retried enqueue add one
+	// job; a single node ignores it, but refuses the same malformed ones.
+	if key := r.Header.Get(RequestIDHeader); key != "" {
+		if len(key) > jobq.MaxRequestIDLen {
+			writeEngineError(w, jobq.ErrRequestIDTooLong)
+			return
+		}
+		opts = append(opts, jobq.WithRequestID(key))
 	}
 	id, err := h.q.Enqueue(topic, payload, opts...)
 	if err != nil {
