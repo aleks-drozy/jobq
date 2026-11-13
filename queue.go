@@ -24,6 +24,10 @@ type Queue struct {
 	now  func() time.Time
 	wal  *wal // nil in in-memory mode
 	wopt walOptions
+	// newID and passive are the two hooks a replicated state machine
+	// needs; see WithIDSource and WithPassiveReads.
+	newID   func() string
+	passive bool
 
 	mu          sync.RWMutex
 	topics      map[string]*topic
@@ -39,6 +43,27 @@ type Option func(*Queue)
 // deterministically instead of sleeping.
 func WithClock(now func() time.Time) Option {
 	return func(q *Queue) { q.now = now }
+}
+
+// WithIDSource replaces the random job and lease ID generator. IDs must be
+// 32 lowercase hex characters and unique for the life of the queue.
+//
+// It exists for replication: replicas applying the same log must mint the
+// same IDs, so the cluster package derives them from the log position
+// instead of from crypto/rand.
+func WithIDSource(next func() string) Option {
+	return func(q *Queue) { q.newID = next }
+}
+
+// WithPassiveReads stops Stats and Peek from observing lease expiry, so a
+// read never changes queue state. Expiry is then observed only by Dequeue,
+// Ack, Nack, Extend and ExpireLeases. Counts can lag: a lease past its
+// deadline stays in InFlight until one of those runs.
+//
+// It exists for replication, where a read served by one replica must not
+// move that replica's state ahead of the others.
+func WithPassiveReads() Option {
+	return func(q *Queue) { q.passive = true }
 }
 
 // WithSync selects the fsync policy for a durable queue (see SyncPolicy for
@@ -231,6 +256,43 @@ func (q *Queue) Peek(topicName string, limit int, includeInflight bool) (ready, 
 	return ready, inflight, err
 }
 
+// Pending reports whether a Dequeue on topic at time at would find work: a
+// ready job whose delay has passed, or a lease whose deadline has. Unlike
+// every other read it takes the time as an argument and observes nothing,
+// so it is safe to ask about a moment the queue's own clock has not
+// reached. A replicated leader uses it to answer an idle poll without
+// writing to the log.
+func (q *Queue) Pending(topicName string, at time.Time) bool {
+	tp, err := q.topicFor(topicName, false)
+	if err != nil || tp == nil {
+		return false
+	}
+	return tp.pending(at)
+}
+
+// ExpireLeases ends every outstanding lease on every topic, exactly as a
+// restart does: each leased job returns to its ready list with its attempt
+// count, or dead-letters if it has none left. Topics are visited in name
+// order so the result does not depend on map iteration.
+func (q *Queue) ExpireLeases() {
+	q.mu.RLock()
+	names := make([]string, 0, len(q.topics))
+	for name := range q.topics {
+		names = append(names, name)
+	}
+	sortStrings(names)
+	tps := make([]*topic, 0, len(names))
+	for _, name := range names {
+		tps = append(tps, q.topics[name])
+	}
+	q.mu.RUnlock()
+	// The registry lock is released first: retiring an exhausted job
+	// creates its dead-letter topic, which takes the write lock.
+	for _, tp := range tps {
+		tp.expireAll()
+	}
+}
+
 // Topics lists the known topic names, including dead-letter topics.
 func (q *Queue) Topics() []string {
 	q.mu.RLock()
@@ -342,6 +404,8 @@ func (q *Queue) makeTopicLocked(name string, initial []*Job) (*topic, error) {
 		logRec:     logRec,
 		walID:      id,
 		initial:    initial,
+		newID:      q.newID,
+		passive:    q.passive,
 	})
 	q.topics[name] = tp
 	return tp, nil

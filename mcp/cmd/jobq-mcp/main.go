@@ -16,7 +16,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -119,7 +118,7 @@ func run(args []string) error {
 // logic cmd/jobq/main.go already applies to the same problem for the jobq
 // CLI's --wait flag.
 func newHTTPBackend(addr string, maxWait time.Duration) jobqmcp.Backend {
-	return jobqhttp.NewClient(addr, jobqhttp.WithHTTPClient(&http.Client{Timeout: maxWait + 10*time.Second}))
+	return jobqhttp.NewClient(addr, jobqhttp.WithTimeout(maxWait+10*time.Second))
 }
 
 // serverOptions builds the jobqmcp.ServerOptions for mode. Addr is set only

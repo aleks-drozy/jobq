@@ -16,6 +16,9 @@ type HardState struct {
 // comes back.
 //
 // A Storage is owned by exactly one Node and is not called concurrently.
+//
+// A Storage that also implements Syncer loosens "before it returns" to
+// "before Sync returns"; see Syncer for what that asks of the driver.
 type Storage interface {
 	// Load returns the state to restart from. The log must be contiguous
 	// and start at index 1.
@@ -25,6 +28,17 @@ type Storage interface {
 	Append([]Entry) error
 	// TruncateFrom removes the entry at index and everything after it.
 	TruncateFrom(index uint64) error
+}
+
+// Syncer is implemented by a Storage that buffers its writes so that many
+// of them can share one fsync. The node never performs I/O and cannot tell
+// the difference, so the durability promise moves to whoever drives it:
+// after any Tick, Step or Propose, the driver must call Sync and see it
+// succeed before it sends a message or applies an entry from Ready. A
+// crash before Sync then loses only writes nobody outside the process ever
+// heard about.
+type Syncer interface {
+	Sync() error
 }
 
 // MemoryStorage is a Storage that lives in memory. It survives a Node being

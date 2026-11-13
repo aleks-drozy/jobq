@@ -33,6 +33,13 @@ const (
 	recAdopt     recType = 0x06 // moved into a DLQ topic
 	recDrop      recType = 0x07 // terminal: destroyed inside a DLQ (visible via Stats.Dropped)
 	recCleanShut recType = 0x08 // written and synced by Close
+
+	// Records of a Raft log (raftlog.go). A directory holds either a
+	// single-node queue log or a Raft log, never both; each reader refuses
+	// the other's records.
+	recRaftEntry    recType = 0x10 // one log entry: index, term, kind, data
+	recRaftTruncate recType = 0x11 // drop the entry at index and all after it
+	recRaftHard     recType = 0x12 // current term and vote
 )
 
 var (
@@ -61,7 +68,12 @@ type walRecord struct {
 	Attempts    int    // recDeliver, recRetry; DeadLetteredAttempts on recAdopt
 	At          time.Time
 	Delay       time.Duration // recEnqueue
-	Payload     []byte        // recEnqueue
+	Payload     []byte        // recEnqueue; entry data on recRaftEntry
+
+	Index uint64 // recRaftEntry, recRaftTruncate
+	Term  uint64 // recRaftEntry, recRaftHard
+	Kind  uint8  // recRaftEntry
+	Voted uint64 // recRaftHard
 }
 
 func writeRecord(w io.Writer, rec walRecord) error {
@@ -149,6 +161,17 @@ func encodeBody(rec walRecord) ([]byte, error) {
 		b = appendTime(b, rec.At)
 	case recCleanShut:
 		// empty body
+	case recRaftEntry:
+		b = binary.LittleEndian.AppendUint64(b, rec.Index)
+		b = binary.LittleEndian.AppendUint64(b, rec.Term)
+		b = append(b, rec.Kind)
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(rec.Payload)))
+		b = append(b, rec.Payload...)
+	case recRaftTruncate:
+		b = binary.LittleEndian.AppendUint64(b, rec.Index)
+	case recRaftHard:
+		b = binary.LittleEndian.AppendUint64(b, rec.Term)
+		b = binary.LittleEndian.AppendUint64(b, rec.Voted)
 	default:
 		return nil, fmt.Errorf("jobq: unknown record type %#x", rec.Type)
 	}
@@ -180,6 +203,16 @@ func decodeBody(t recType, body []byte) (walRecord, error) {
 		rec.Attempts = int(d.uvarint())
 		rec.At = d.time()
 	case recCleanShut:
+	case recRaftEntry:
+		rec.Index = d.u64()
+		rec.Term = d.u64()
+		rec.Kind = d.u8()
+		rec.Payload = d.bytes(int(d.u32()))
+	case recRaftTruncate:
+		rec.Index = d.u64()
+	case recRaftHard:
+		rec.Term = d.u64()
+		rec.Voted = d.u64()
 	default:
 		return rec, errBadFrame
 	}
@@ -234,6 +267,22 @@ func (d *decoder) u32() uint32 {
 		return 0
 	}
 	return binary.LittleEndian.Uint32(b)
+}
+
+func (d *decoder) u64() uint64 {
+	b := d.take(8)
+	if b == nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(b)
+}
+
+func (d *decoder) u8() uint8 {
+	b := d.take(1)
+	if b == nil {
+		return 0
+	}
+	return b[0]
 }
 
 func (d *decoder) uvarint() uint64 {

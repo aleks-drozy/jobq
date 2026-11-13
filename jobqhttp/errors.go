@@ -24,6 +24,12 @@ var sentinelTable = []struct {
 	{jobq.ErrReservedTopic, http.StatusBadRequest, "reserved_topic"},
 	{jobq.ErrNonPositiveDuration, http.StatusBadRequest, "non_positive_duration"},
 	{jobq.ErrClosed, http.StatusServiceUnavailable, "closed"},
+	// 421 Misdirected Request: the request was fine, it went to a node
+	// that cannot act on it. Nothing was applied.
+	{jobq.ErrNotLeader, http.StatusMisdirectedRequest, "not_leader"},
+	// 503 for an outcome the node could not confirm. Unlike not_leader
+	// this is not a clean refusal: the operation may have been applied.
+	{jobq.ErrUnavailable, http.StatusServiceUnavailable, "unavailable"},
 }
 
 var codeToSentinel = func() map[string]error {
@@ -65,6 +71,9 @@ func (e *apiError) Error() string {
 // *apiError carrying the status and code for callers that want to branch on
 // it directly.
 func errorFromEnvelope(status int, env errorEnvelope) error {
+	if env.Error.Code == "not_leader" {
+		return &jobq.NotLeaderError{Leader: env.Error.Leader}
+	}
 	if sentinel, ok := codeToSentinel[env.Error.Code]; ok {
 		return sentinel
 	}

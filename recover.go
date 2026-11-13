@@ -16,10 +16,15 @@ package jobq
 // repair from.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"time"
 )
+
+// errRaftLogDir is returned by Open for a directory that holds a Raft log:
+// replaying it as a single-node queue would silently produce an empty one.
+var errRaftLogDir = errors.New("jobq: directory holds a replicated node's log, not a single-node queue")
 
 // RecoveryReport says what replay found and did. It is returned by Open so
 // an operator can log it; nothing here is hidden.
@@ -47,23 +52,32 @@ type replayJob struct {
 	seq      int // FIFO position; reassigned on every requeue
 }
 
-func replayDir(walDir string) (*replayState, RecoveryReport, error) {
-	var rep RecoveryReport
+// scanReport is what scanWAL found on disk, before any meaning is attached
+// to the records.
+type scanReport struct {
+	segments  int
+	records   int
+	torn      bool
+	truncated int64
+	last      recType
+}
+
+// scanWAL reads every record in walDir in log order and hands each to fn.
+// It owns the torn-tail rule (truncate the last segment at its last good
+// record) and the corruption rule (anything bad earlier is an error), so
+// the queue's replay and the Raft log's replay cannot disagree about them.
+func scanWAL(walDir string, fn func(walRecord) error) (scanReport, error) {
+	var rep scanReport
 	segs, err := listSegments(walDir)
 	if err != nil {
-		return nil, rep, err
+		return rep, err
 	}
-	rep.Segments = len(segs)
-
-	topics := map[uint32]string{}
-	jobs := map[string]*replayJob{}
-	seq := 0
-	var lastType recType
+	rep.segments = len(segs)
 
 	for i, seg := range segs {
 		raw, err := os.ReadFile(seg.path)
 		if err != nil {
-			return nil, rep, err
+			return rep, err
 		}
 		buf := raw[segmentHeaderSize:]
 		off := int64(segmentHeaderSize)
@@ -72,28 +86,53 @@ func replayDir(walDir string) (*replayState, RecoveryReport, error) {
 			if err != nil {
 				last := i == len(segs)-1
 				if !last {
-					return nil, rep, fmt.Errorf(
+					return rep, fmt.Errorf(
 						"jobq: corruption in non-tail segment %s at offset %d: %w",
 						seg.path, off, err)
 				}
 				// Torn tail: truncate the file at the last good record so
 				// the next writer resumes after valid bytes.
-				rep.TornTail = true
-				rep.BytesTruncated = int64(len(buf))
+				rep.torn = true
+				rep.truncated = int64(len(buf))
 				if terr := os.Truncate(seg.path, off); terr != nil {
-					return nil, rep, fmt.Errorf("jobq: truncating torn tail: %w", terr)
+					return rep, fmt.Errorf("jobq: truncating torn tail: %w", terr)
 				}
 				buf = nil
 				continue
 			}
-			applyRecord(rec, topics, jobs, &seq)
-			lastType = rec.Type
-			rep.RecordsApplied++
+			if err := fn(rec); err != nil {
+				return rep, fmt.Errorf("jobq: segment %s at offset %d: %w", seg.path, off, err)
+			}
+			rep.last = rec.Type
+			rep.records++
 			buf = buf[n:]
 			off += int64(n)
 		}
 	}
-	rep.CleanShutdown = lastType == recCleanShut
+	return rep, nil
+}
+
+func replayDir(walDir string) (*replayState, RecoveryReport, error) {
+	var rep RecoveryReport
+	topics := map[uint32]string{}
+	jobs := map[string]*replayJob{}
+	seq := 0
+
+	scan, err := scanWAL(walDir, func(rec walRecord) error {
+		if rec.Type >= recRaftEntry {
+			return errRaftLogDir
+		}
+		applyRecord(rec, topics, jobs, &seq)
+		return nil
+	})
+	rep.Segments = scan.segments
+	rep.RecordsApplied = scan.records
+	rep.TornTail = scan.torn
+	rep.BytesTruncated = scan.truncated
+	if err != nil {
+		return nil, rep, err
+	}
+	rep.CleanShutdown = scan.last == recCleanShut
 
 	// Settle the crash-time in-flight set: expired, per the spec.
 	st := &replayState{topicJobs: map[string][]*Job{}, topics: topics}

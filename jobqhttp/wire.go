@@ -145,4 +145,20 @@ type errorEnvelope struct {
 type errorBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Leader is set only with code "not_leader": the address clients
+	// should use for the node believed to lead, when one is known.
+	Leader string `json:"leader,omitempty"`
+}
+
+// ClusterStatus is the body of GET /v1/cluster: one node's own view.
+type ClusterStatus struct {
+	ID    uint64 `json:"id"`
+	State string `json:"state"` // "leader", "follower" or "candidate"
+	Term  uint64 `json:"term"`
+	// Leader is the node this one believes leads; 0 if it knows of none.
+	Leader     uint64 `json:"leader"`
+	LeaderAddr string `json:"leader_addr,omitempty"`
+	Commit     uint64 `json:"commit"`
+	Applied    uint64 `json:"applied"`
+	LastIndex  uint64 `json:"last_index"`
 }
