@@ -57,7 +57,8 @@ type wal struct {
 	waiters []waiter // released after the covering fsync (SyncAlways)
 	failed  error    // sticky first error; nil while healthy
 	closed  bool
-	kick    chan struct{} // wakes the committer; capacity 1
+	cuts    []chan cutResult // callers waiting for a segment boundary
+	kick    chan struct{}    // wakes the committer; capacity 1
 
 	seg *segmentWriter
 
@@ -144,6 +145,38 @@ func (w *wal) append(rec walRecord, gated bool) waiter {
 	return done
 }
 
+// cutResult answers a cut: the log offset the fresh segment starts at.
+type cutResult struct {
+	base uint64
+	err  error
+}
+
+// cut makes everything appended so far durable and starts a new segment,
+// so that every record appended after it lands in segments whose base
+// offset is at least the one returned. Whoever then makes the older
+// segments redundant may delete them whole.
+func (w *wal) cut() (uint64, error) {
+	done := make(chan cutResult, 1)
+	w.mu.Lock()
+	switch {
+	case w.failed != nil:
+		err := w.failed
+		w.mu.Unlock()
+		return 0, err
+	case w.closed:
+		w.mu.Unlock()
+		return 0, ErrClosed
+	}
+	w.cuts = append(w.cuts, done)
+	w.mu.Unlock()
+	select {
+	case w.kick <- struct{}{}:
+	default:
+	}
+	r := <-done
+	return r.base, r.err
+}
+
 // committer is the only goroutine that touches the segment files.
 func (w *wal) committer() {
 	defer close(w.committerDone)
@@ -159,7 +192,7 @@ func (w *wal) committer() {
 	for {
 		select {
 		case <-w.kick:
-			batch, waiters, closing := w.takeBatch()
+			batch, waiters, cuts, closing := w.takeBatch()
 			if len(batch) > 0 {
 				err := w.seg.write(batch)
 				if err == nil && w.opts.policy == SyncAlways {
@@ -169,11 +202,29 @@ func (w *wal) committer() {
 				}
 				if err != nil {
 					w.fail(err, waiters)
+					w.failCuts(cuts)
+					if closing {
+						return // close is waiting on this goroutine
+					}
 					continue
 				}
 			}
 			for _, done := range waiters {
 				done <- nil
+			}
+			if len(cuts) > 0 {
+				// The batch above is already written, so the boundary
+				// falls after everything appended before the cut.
+				base, err := w.seg.cut()
+				if err != nil {
+					w.fail(err, nil)
+					w.failCuts(cuts)
+					continue
+				}
+				dirty = false // cut synced the segment it closed
+				for _, done := range cuts {
+					done <- cutResult{base: base}
+				}
 			}
 			if closing {
 				return
@@ -192,12 +243,23 @@ func (w *wal) committer() {
 
 // takeBatch swaps out everything pending. closing reports that close() has
 // been requested and this batch is the last.
-func (w *wal) takeBatch() (batch []byte, waiters []waiter, closing bool) {
+func (w *wal) takeBatch() (batch []byte, waiters []waiter, cuts []chan cutResult, closing bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	batch, w.pending = w.pending, nil
 	waiters, w.waiters = w.waiters, nil
-	return batch, waiters, w.closed
+	cuts, w.cuts = w.cuts, nil
+	return batch, waiters, cuts, w.closed
+}
+
+// failCuts answers cut callers after the WAL has failed.
+func (w *wal) failCuts(cuts []chan cutResult) {
+	w.mu.Lock()
+	err := w.failed
+	w.mu.Unlock()
+	for _, done := range cuts {
+		done <- cutResult{err: err}
+	}
 }
 
 // fail marks the WAL broken and releases every waiter with the error.

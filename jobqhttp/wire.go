@@ -161,4 +161,12 @@ type ClusterStatus struct {
 	Commit     uint64 `json:"commit"`
 	Applied    uint64 `json:"applied"`
 	LastIndex  uint64 `json:"last_index"`
+	// SnapshotIndex is the log index this node's snapshot covers, and
+	// FirstIndex the oldest log entry it still holds. A node whose log is
+	// behind another's FirstIndex can only be caught up by snapshot.
+	SnapshotIndex uint64 `json:"snapshot_index"`
+	FirstIndex    uint64 `json:"first_index"`
 }
+
+// RequestIDHeader carries an enqueue's request ID; see jobq.WithRequestID.
+const RequestIDHeader = "Idempotency-Key"

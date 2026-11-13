@@ -31,6 +31,8 @@ var (
 	// ErrNonPositiveDuration means a visibility timeout or extension was
 	// zero or negative, which would issue an already-expired lease.
 	ErrNonPositiveDuration = errors.New("jobq: duration must be positive")
+	// ErrRequestIDTooLong means a request ID exceeded MaxRequestIDLen.
+	ErrRequestIDTooLong = errors.New("jobq: request id is too long")
 	// ErrNotLeader means a replicated node was asked to change the queue
 	// but is not the cluster's leader. The operation was not applied. The
 	// error may be a *NotLeaderError carrying the leader's address.
@@ -98,7 +100,13 @@ type EnqueueOptions struct {
 	Delay time.Duration
 	// MaxAttempts overrides DefaultMaxAttempts when > 0.
 	MaxAttempts int
+	// RequestID names this enqueue so that sending it twice adds one job;
+	// see WithRequestID.
+	RequestID string
 }
+
+// MaxRequestIDLen bounds a request ID.
+const MaxRequestIDLen = 128
 
 func (o EnqueueOptions) normalize() EnqueueOptions {
 	if o.MaxAttempts <= 0 {

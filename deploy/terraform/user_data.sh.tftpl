@@ -1,0 +1,77 @@
+#!/bin/bash
+# First boot of jobq node ${node_id}. Runs once, as root, from cloud-init.
+# Output goes to /var/log/cloud-init-output.log.
+set -euo pipefail
+
+useradd --system --home-dir /var/lib/jobq --shell /sbin/nologin jobq
+install -d -o jobq -g jobq -m 0700 /var/lib/jobq/data
+
+aws s3 cp --region "${region}" "s3://${bucket}/${binary_key}" /usr/local/bin/jobqd
+chmod 0755 /usr/local/bin/jobqd
+
+# -break-lock is safe here and only here: systemd runs one jobqd for this
+# directory, so a lock file found at start was left by a process that is
+# gone.
+cat > /etc/systemd/system/jobqd.service <<'UNIT'
+[Unit]
+Description=jobq node ${node_id}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=jobq
+Group=jobq
+ExecStart=/usr/local/bin/jobqd \
+  -id ${node_id} \
+  -dir /var/lib/jobq/data \
+  -addr 0.0.0.0:8080 \
+  -peer-addr ${private_ip}:9090 \
+  -peers ${peers} \
+  -advertise ${advertise} \
+  -sync always \
+  -break-lock
+Restart=always
+RestartSec=1
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/jobq
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# Publishes what this node knows about leadership, for the no-leader alarm.
+# A node that cannot answer its own /metrics reports 0.
+cat > /usr/local/bin/jobq-leader-metric <<'SCRIPT'
+#!/bin/bash
+while true; do
+  value=$(curl -s --max-time 2 http://127.0.0.1:8080/metrics | awk '$1 == "jobq_raft_has_leader" { print $2 }')
+  aws cloudwatch put-metric-data --region "${region}" --namespace jobq \
+    --metric-name HasLeader --dimensions "Cluster=${cluster_name}" \
+    --storage-resolution 1 --value "$${value:-0}" || true
+  sleep 5
+done
+SCRIPT
+chmod 0755 /usr/local/bin/jobq-leader-metric
+
+cat > /etc/systemd/system/jobq-leader-metric.service <<'UNIT'
+[Unit]
+Description=publish jobq HasLeader to CloudWatch
+After=jobqd.service
+
+[Service]
+User=jobq
+Group=jobq
+ExecStart=/usr/local/bin/jobq-leader-metric
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now jobqd.service jobq-leader-metric.service

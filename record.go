@@ -40,6 +40,13 @@ const (
 	recRaftEntry    recType = 0x10 // one log entry: index, term, kind, data
 	recRaftTruncate recType = 0x11 // drop the entry at index and all after it
 	recRaftHard     recType = 0x12 // current term and vote
+	// Compaction rewrites the log in steps so that it is atomic: after a
+	// recRaftBegin the entries to keep are written as recRaftKeep, which
+	// replay sets aside, and a recRaftSnap then swaps them in. A crash
+	// before the recRaftSnap leaves the old log in force.
+	recRaftBegin recType = 0x13 // a compaction starts; forget any staged before
+	recRaftKeep  recType = 0x14 // an entry kept across a compaction
+	recRaftSnap  recType = 0x15 // snapshot at index/term replaces the log
 )
 
 var (
@@ -70,9 +77,9 @@ type walRecord struct {
 	Delay       time.Duration // recEnqueue
 	Payload     []byte        // recEnqueue; entry data on recRaftEntry
 
-	Index uint64 // recRaftEntry, recRaftTruncate
-	Term  uint64 // recRaftEntry, recRaftHard
-	Kind  uint8  // recRaftEntry
+	Index uint64 // recRaftEntry, recRaftKeep, recRaftTruncate, recRaftSnap
+	Term  uint64 // recRaftEntry, recRaftKeep, recRaftHard, recRaftSnap
+	Kind  uint8  // recRaftEntry, recRaftKeep
 	Voted uint64 // recRaftHard
 }
 
@@ -159,14 +166,17 @@ func encodeBody(rec walRecord) ([]byte, error) {
 		b = binary.LittleEndian.AppendUint32(b, rec.TopicID)
 		b = binary.AppendUvarint(b, uint64(rec.Attempts))
 		b = appendTime(b, rec.At)
-	case recCleanShut:
+	case recCleanShut, recRaftBegin:
 		// empty body
-	case recRaftEntry:
+	case recRaftEntry, recRaftKeep:
 		b = binary.LittleEndian.AppendUint64(b, rec.Index)
 		b = binary.LittleEndian.AppendUint64(b, rec.Term)
 		b = append(b, rec.Kind)
 		b = binary.LittleEndian.AppendUint32(b, uint32(len(rec.Payload)))
 		b = append(b, rec.Payload...)
+	case recRaftSnap:
+		b = binary.LittleEndian.AppendUint64(b, rec.Index)
+		b = binary.LittleEndian.AppendUint64(b, rec.Term)
 	case recRaftTruncate:
 		b = binary.LittleEndian.AppendUint64(b, rec.Index)
 	case recRaftHard:
@@ -202,12 +212,15 @@ func decodeBody(t recType, body []byte) (walRecord, error) {
 		rec.TopicID = d.u32()
 		rec.Attempts = int(d.uvarint())
 		rec.At = d.time()
-	case recCleanShut:
-	case recRaftEntry:
+	case recCleanShut, recRaftBegin:
+	case recRaftEntry, recRaftKeep:
 		rec.Index = d.u64()
 		rec.Term = d.u64()
 		rec.Kind = d.u8()
 		rec.Payload = d.bytes(int(d.u32()))
+	case recRaftSnap:
+		rec.Index = d.u64()
+		rec.Term = d.u64()
 	case recRaftTruncate:
 		rec.Index = d.u64()
 	case recRaftHard:

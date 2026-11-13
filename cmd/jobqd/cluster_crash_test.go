@@ -153,6 +153,11 @@ func (c *crashCluster) start(n *crashNode) {
 		"-peers", strings.Join(peers, ","),
 		"-advertise", strings.Join(advertise, ","),
 		"-sync", "always",
+		// Small, so that the run crosses many snapshots: nodes restart
+		// from one, and a killed leader comes back to a cluster that has
+		// compacted past what it holds.
+		"-snapshot-every", "300",
+		"-snapshot-keep", "50",
 	}
 	cmd := exec.Command(c.exe, "-test.run", "XXX_NONE")
 	cmd.Env = append(os.Environ(), clusterChildEnv+"="+strings.Join(args, "\n"))
@@ -425,6 +430,14 @@ func TestClusterLosesNothingAcknowledgedAcrossLeaderKills(t *testing.T) {
 	if main.Enqueued < len(enqueued) {
 		t.Errorf("nodes hold %d enqueues but %d were acknowledged", main.Enqueued, len(enqueued))
 	}
+	// And no more than one per call that failed. The client retries an
+	// enqueue under one request ID, so a retry that follows a lost reply
+	// must not add a second job; only a call that gave up without ever
+	// hearing back can leave a job the client does not know about.
+	if extra := int64(main.Enqueued - len(enqueued)); extra > ambiguous.Load() {
+		t.Errorf("nodes hold %d enqueues nobody was told about, but only %d calls failed: a retry enqueued twice",
+			extra, ambiguous.Load())
+	}
 	// Every job the nodes consider finished was acked or dropped for
 	// running out of attempts; none simply vanished. And the nodes
 	// recorded at least every ack the client saw acknowledged.
@@ -451,9 +464,30 @@ func TestClusterLosesNothingAcknowledgedAcrossLeaderKills(t *testing.T) {
 	if redelivered == 0 {
 		t.Errorf("no job was delivered twice: no kill caught a job in flight")
 	}
-	t.Logf("contract held: %d acknowledged enqueues, %d lost, %d ghosts; %d completed, %d settled by an "+
+	// Every restart after the first snapshot starts from one, and the logs
+	// say so. Count them, and the snapshots taken, from what the nodes
+	// themselves printed.
+	taken, loaded := 0, 0
+	for _, n := range c.nodes {
+		out := n.out.String()
+		taken += strings.Count(out, " snapshotted at index ")
+		loaded += strings.Count(out, " loaded a snapshot at index ")
+	}
+	if taken < 3 || loaded < 3 {
+		t.Errorf("nodes took %d snapshots and loaded %d: the run did not exercise restarting from one", taken, loaded)
+	}
+	t.Logf("snapshots: %d taken, %d loaded", taken, loaded)
+	if st.SnapshotIndex == 0 || st.FirstIndex <= 1 {
+		t.Errorf("the leader never compacted its log (snapshot at %d, log from %d): the run did not cross a snapshot",
+			st.SnapshotIndex, st.FirstIndex)
+	}
+	verdict := "contract held"
+	if t.Failed() {
+		verdict = "CONTRACT BROKEN"
+	}
+	t.Logf(verdict+": %d acknowledged enqueues, %d lost, %d ghosts; %d completed, %d settled by an "+
 		"unconfirmed ack; %d jobs redelivered, %d dead-lettered; nodes hold %d enqueues (%d the client "+
-		"never saw acknowledged, of %d failed calls); final term %d, log index %d",
+		"never saw acknowledged, of %d failed calls); final term %d, log index %d, snapshot at %d, log kept from %d",
 		len(enqueued), lost, len(ghosts), len(completed), unconfirmed, redelivered, main.DeadLetters,
-		main.Enqueued, main.Enqueued-len(enqueued), ambiguous.Load(), st.Term, st.LastIndex)
+		main.Enqueued, main.Enqueued-len(enqueued), ambiguous.Load(), st.Term, st.LastIndex, st.SnapshotIndex, st.FirstIndex)
 }

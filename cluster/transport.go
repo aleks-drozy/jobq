@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -28,6 +29,9 @@ const (
 	peerQueueSize   = 1024
 	peerBatchMax    = 64
 	peerSendTimeout = 2 * time.Second
+	// snapshotSendTimeout is the allowance for a batch that carries a
+	// snapshot, which can be many megabytes.
+	snapshotSendTimeout = 60 * time.Second
 	// maxPeerBody bounds one batch on the receiving side.
 	maxPeerBody = 256 << 20
 )
@@ -47,7 +51,7 @@ type HTTPTransport struct {
 // Each value is the peer's base URL, for example "http://10.0.1.12:9090".
 func NewHTTPTransport(self raft.NodeID, peers map[raft.NodeID]string) *HTTPTransport {
 	t := &HTTPTransport{
-		client: &http.Client{Timeout: peerSendTimeout},
+		client: &http.Client{},
 		queues: map[raft.NodeID]chan raft.Message{},
 		stop:   make(chan struct{}),
 	}
@@ -91,24 +95,49 @@ func (t *HTTPTransport) sender(url string, q chan raft.Message) {
 		case first = <-q:
 		}
 		body := appendFrame(nil, first)
+		timeout := peerSendTimeout
+		if first.Type == raft.MsgSnapshot {
+			timeout = snapshotSendTimeout
+		}
 	fill:
 		for i := 1; i < peerBatchMax; i++ {
 			select {
 			case m := <-q:
 				body = appendFrame(body, m)
+				if m.Type == raft.MsgSnapshot {
+					timeout = snapshotSendTimeout
+				}
 			default:
 				break fill
 			}
 		}
 		// A failed send is not retried: Raft resends what still matters
 		// on its next heartbeat, and by then this batch may be stale.
-		resp, err := t.client.Post(url, "application/octet-stream", bytes.NewReader(body))
-		if err != nil {
-			continue
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		t.post(url, body, timeout)
 	}
+}
+
+func (t *HTTPTransport) post(url string, body []byte, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	go func() {
+		select {
+		case <-t.stop:
+			cancel() // do not hold Close up for a send in flight
+		case <-ctx.Done():
+		}
+	}()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 }
 
 // PeerHandler serves PeerPath for n: it decodes a batch and steps the node
@@ -181,6 +210,17 @@ func appendMessage(b []byte, m raft.Message) []byte {
 		b = append(b, byte(e.Kind))
 		b = appendBytes(b, e.Data)
 	}
+	// Only a MsgSnapshot carries the snapshot section, so every other
+	// message is laid out exactly as it was before snapshots existed.
+	if m.Type == raft.MsgSnapshot {
+		var s raft.Snapshot
+		if m.Snapshot != nil {
+			s = *m.Snapshot
+		}
+		b = binary.LittleEndian.AppendUint64(b, s.Index)
+		b = binary.LittleEndian.AppendUint64(b, s.Term)
+		b = appendBytes(b, s.Data)
+	}
 	return b
 }
 
@@ -206,7 +246,12 @@ func decodeMessage(b []byte) (raft.Message, error) {
 		e.Data = r.bytes()
 		m.Entries = append(m.Entries, e)
 	}
-	if r.bad || len(r.buf) != 0 || m.Type < raft.MsgVote || m.Type > raft.MsgAppendResp {
+	if m.Type == raft.MsgSnapshot {
+		s := raft.Snapshot{Index: r.u64(), Term: r.u64()}
+		s.Data = r.bytes()
+		m.Snapshot = &s
+	}
+	if r.bad || len(r.buf) != 0 || m.Type < raft.MsgVote || m.Type > raft.MsgSnapshot {
 		return raft.Message{}, errBadMessage
 	}
 	return m, nil

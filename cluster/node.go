@@ -57,6 +57,17 @@ type Config struct {
 	// MaxEntriesPerMsg bounds one append message. Default 512.
 	MaxEntriesPerMsg int
 
+	// SnapshotEvery is how many applied entries a node lets build up past
+	// its last snapshot before it takes another and drops the log behind
+	// it. Each node counts for itself. Zero means 16384; negative means
+	// never, and the log then grows without bound.
+	SnapshotEvery int
+	// SnapshotKeep is how many entries a node holds on to behind a
+	// snapshot, so that a follower only that far behind is caught up from
+	// the log instead of being sent the whole snapshot. Zero means a
+	// quarter of SnapshotEvery; negative means none.
+	SnapshotKeep int
+
 	// Timeout is how long an operation waits for a majority to commit it
 	// before giving up with jobq.ErrUnavailable. Default 5s.
 	Timeout time.Duration
@@ -88,8 +99,11 @@ type Node struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
-	status atomic.Pointer[Status]
-	failed atomic.Pointer[error]
+	status  atomic.Pointer[Status]
+	failed  atomic.Pointer[error]
+	metrics metrics
+	// lastLeader is the last leader this node knew of. Run loop only.
+	lastLeader raft.NodeID
 }
 
 type proposal struct {
@@ -101,6 +115,7 @@ type proposal struct {
 // entry it proposed apart from a different one that took the same index.
 type waiter struct {
 	term  uint64
+	since time.Time
 	reply chan result
 }
 
@@ -127,6 +142,15 @@ func Start(cfg Config) (*Node, error) {
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 5 * time.Second
+	}
+	if cfg.SnapshotEvery == 0 {
+		cfg.SnapshotEvery = 16384
+	}
+	if cfg.SnapshotKeep == 0 {
+		cfg.SnapshotKeep = cfg.SnapshotEvery / 4
+	}
+	if cfg.SnapshotKeep < 0 {
+		cfg.SnapshotKeep = 0
 	}
 	if cfg.Clock == nil {
 		cfg.Clock = time.Now
@@ -162,7 +186,7 @@ func Start(cfg Config) (*Node, error) {
 		done:      make(chan struct{}),
 	}
 	n.sync, _ = cfg.Storage.(raft.Syncer)
-	n.publish()
+	n.publish(n.rn.Status())
 	go n.run()
 	return n, nil
 }
@@ -207,7 +231,7 @@ func (n *Node) LeaderAddr() string {
 func (n *Node) Close() error {
 	n.closeOnce.Do(func() { close(n.stop) })
 	<-n.done
-	return n.sm.q.Close()
+	return n.sm.queue().Close()
 }
 
 // run is the only goroutine that touches the raft.Node.
@@ -252,14 +276,32 @@ func (n *Node) run() {
 			err = n.sync.Sync()
 		}
 		if err != nil {
-			werr := fmt.Errorf("cluster: node %d stopped: %w", n.cfg.ID, err)
-			n.failed.Store(&werr)
-			n.cfg.Logger.Printf("%v", werr)
+			n.fail(err)
 			return
 		}
 
 		rd := n.rn.Ready()
 		n.send(rd.Messages)
+		if snap := rd.Snapshot; snap != nil {
+			// The queue is replaced whole: on a restart by this node's own
+			// snapshot, otherwise by the leader's because this node fell
+			// too far behind for the log.
+			if err := n.sm.restore(snap.Data, snap.Index); err != nil {
+				n.fail(err)
+				return
+			}
+			n.metrics.snapshotsLoaded.Add(1)
+			n.cfg.Logger.Printf("cluster: node %d loaded a snapshot at index %d (%d bytes)", n.cfg.ID, snap.Index, len(snap.Data))
+			for index, w := range waiters {
+				if index <= snap.Index {
+					// Proposed here while this node led, and never seen
+					// to commit before the snapshot covered that index.
+					// Whether it is in there cannot be told.
+					delete(waiters, index)
+					w.reply <- result{err: jobq.ErrUnavailable}
+				}
+			}
+		}
 		for _, e := range rd.Committed {
 			res := n.sm.apply(e)
 			w, ok := waiters[e.Index]
@@ -272,11 +314,50 @@ func (n *Node) run() {
 				// discarded and can never commit. That is a definite
 				// "did not happen", which is safe to retry.
 				res = result{err: n.notLeader()}
+			} else {
+				n.metrics.commit.observe(time.Since(w.since))
 			}
 			w.reply <- res
 		}
-		n.publish()
+
+		st := n.rn.Status()
+		if every := n.cfg.SnapshotEvery; every > 0 {
+			if applied := n.sm.applied.Load(); applied >= st.SnapshotIndex+uint64(every) {
+				if err := n.snapshot(applied); err != nil {
+					n.fail(err)
+					return
+				}
+				st = n.rn.Status()
+			}
+		}
+		n.publish(st)
 	}
+}
+
+// fail records why the node is stopping on its own.
+func (n *Node) fail(err error) {
+	werr := fmt.Errorf("cluster: node %d stopped: %w", n.cfg.ID, err)
+	n.failed.Store(&werr)
+	n.cfg.Logger.Printf("%v", werr)
+}
+
+// snapshot captures the queue as it stands after the entry at applied and
+// drops the log behind it. It runs on the node's own goroutine, between
+// entries, so the picture is of exactly one log index; the price is that
+// the node does nothing else, heartbeats included, until the snapshot is
+// on disk.
+func (n *Node) snapshot(applied uint64) error {
+	start := time.Now()
+	data := n.sm.snapshot()
+	if err := n.rn.Compact(applied, data, n.cfg.SnapshotKeep); err != nil {
+		return err
+	}
+	took := time.Since(start)
+	n.metrics.snapshots.Add(1)
+	n.metrics.snapshotBytes.Store(uint64(len(data)))
+	n.metrics.snapshotNanos.Store(uint64(took))
+	n.cfg.Logger.Printf("cluster: node %d snapshotted at index %d (%d bytes, %s)", n.cfg.ID, applied, len(data), took.Round(time.Microsecond))
+	return nil
 }
 
 // propose stamps and appends one command if this node leads.
@@ -303,7 +384,7 @@ func (n *Node) propose(p *proposal, waiters map[uint64]waiter) error {
 		p.reply <- result{err: err}
 		return err
 	}
-	waiters[index] = waiter{term: term, reply: p.reply}
+	waiters[index] = waiter{term: term, since: time.Now(), reply: p.reply}
 	return nil
 }
 
@@ -330,8 +411,12 @@ func (n *Node) send(msgs []raft.Message) {
 	}
 }
 
-func (n *Node) publish() {
-	st := Status{Status: n.rn.Status(), Applied: n.sm.applied.Load()}
+func (n *Node) publish(rs raft.Status) {
+	if rs.Leader != raft.None && rs.Leader != n.lastLeader {
+		n.lastLeader = rs.Leader
+		n.metrics.leaderChanges.Add(1)
+	}
+	st := Status{Status: rs, Applied: n.sm.applied.Load()}
 	n.status.Store(&st)
 }
 
@@ -392,7 +477,10 @@ func (n *Node) Enqueue(topic string, payload []byte, opts ...jobq.EnqueueOption)
 	for _, opt := range opts {
 		opt(&o)
 	}
-	r := n.do(command{Op: opEnqueue, Topic: topic, Payload: payload, Delay: o.Delay, MaxAttempts: o.MaxAttempts})
+	if len(o.RequestID) > jobq.MaxRequestIDLen {
+		return "", jobq.ErrRequestIDTooLong
+	}
+	r := n.do(command{Op: opEnqueue, Topic: topic, Payload: payload, Delay: o.Delay, MaxAttempts: o.MaxAttempts, RequestID: o.RequestID})
 	return r.id, r.err
 }
 
@@ -420,7 +508,7 @@ func (n *Node) Dequeue(topic string, visibility time.Duration) (*jobq.Job, jobq.
 	if seen := n.sm.now(); at.Before(seen) {
 		at = seen
 	}
-	if !n.sm.q.Pending(topic, at) {
+	if !n.sm.queue().Pending(topic, at) {
 		return nil, jobq.Lease{}, jobq.ErrNoJob
 	}
 	r := n.do(command{Op: opDequeue, Topic: topic, Duration: visibility})
@@ -463,14 +551,14 @@ func (n *Node) Extend(lease jobq.Lease, d time.Duration) (time.Time, error) {
 // in flight until the next operation on its topic observes the expiry.
 
 // Stats returns this node's counts for one topic.
-func (n *Node) Stats(topic string) jobq.Stats { return n.sm.q.Stats(topic) }
+func (n *Node) Stats(topic string) jobq.Stats { return n.sm.queue().Stats(topic) }
 
 // Topics lists the topics this node knows.
-func (n *Node) Topics() []string { return n.sm.q.Topics() }
+func (n *Node) Topics() []string { return n.sm.queue().Topics() }
 
 // Peek lists jobs on this node without leasing them.
 func (n *Node) Peek(topic string, limit int, includeInflight bool) (ready, inflight []*jobq.Job, err error) {
-	return n.sm.q.Peek(topic, limit, includeInflight)
+	return n.sm.queue().Peek(topic, limit, includeInflight)
 }
 
 type nullTransport struct{}

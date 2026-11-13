@@ -18,6 +18,10 @@ const (
 	opAck
 	opNack
 	opExtend
+	// opEnqueueID is an enqueue that carries a request ID. It is a
+	// separate code, not a new field on opEnqueue, so that a log written
+	// before request IDs existed still decodes.
+	opEnqueueID
 )
 
 // command is one log entry's worth of work. At is filled in by the leader
@@ -31,6 +35,7 @@ type command struct {
 	Payload     []byte        // enqueue
 	Delay       time.Duration // enqueue
 	MaxAttempts int           // enqueue
+	RequestID   string        // enqueue, optional: see jobq.WithRequestID
 	Duration    time.Duration // dequeue: visibility; extend: extension
 	LeaseID     string        // ack, nack, extend
 }
@@ -44,17 +49,26 @@ var errBadCommand = errors.New("cluster: malformed command")
 //	str  topic
 //	...  fields of that op, in the order below
 //
+// An enqueue with a request ID is written as opEnqueueID, which is
+// opEnqueue with the ID appended.
+//
 // where str and bytes are a uvarint length followed by the bytes.
 func (c command) encode() []byte {
-	b := make([]byte, 0, 32+len(c.Topic)+len(c.Payload)+len(c.LeaseID))
+	if c.Op == opEnqueue && c.RequestID != "" {
+		c.Op = opEnqueueID
+	}
+	b := make([]byte, 0, 32+len(c.Topic)+len(c.Payload)+len(c.LeaseID)+len(c.RequestID))
 	b = binary.LittleEndian.AppendUint64(b, uint64(c.At.UnixNano()))
 	b = append(b, byte(c.Op))
 	b = appendBytes(b, []byte(c.Topic))
 	switch c.Op {
-	case opEnqueue:
+	case opEnqueue, opEnqueueID:
 		b = binary.AppendUvarint(b, uint64(nonNegative(int64(c.Delay))))
 		b = binary.AppendUvarint(b, uint64(nonNegative(int64(c.MaxAttempts))))
 		b = appendBytes(b, c.Payload)
+		if c.Op == opEnqueueID {
+			b = appendBytes(b, []byte(c.RequestID))
+		}
 	case opDequeue:
 		b = binary.AppendUvarint(b, uint64(nonNegative(int64(c.Duration))))
 	case opAck, opNack:
@@ -71,10 +85,16 @@ func decodeCommand(b []byte) (command, error) {
 	c := command{At: time.Unix(0, int64(d.u64())).UTC(), Op: op(d.u8())}
 	c.Topic = string(d.bytes())
 	switch c.Op {
-	case opEnqueue:
+	case opEnqueue, opEnqueueID:
 		c.Delay = time.Duration(d.uvarint())
 		c.MaxAttempts = int(d.uvarint())
 		c.Payload = d.bytes()
+		if c.Op == opEnqueueID {
+			c.RequestID = string(d.bytes())
+			if c.RequestID == "" {
+				d.bad = true // the encoder never writes this form without one
+			}
+		}
 	case opDequeue:
 		c.Duration = time.Duration(d.uvarint())
 	case opAck, opNack:

@@ -34,11 +34,16 @@ type testCluster struct {
 	t       *testing.T
 	nodes   map[NodeID]*Node
 	applied map[NodeID][]Entry
+	loaded  map[NodeID][]Snapshot // snapshots handed out through Ready
+	down    map[NodeID]bool       // nodes that hear nothing
+	lose    func(Message) bool    // messages the network drops
+	sent    []Message             // every message delivered or dropped
 }
 
 func newTestCluster(t *testing.T, size int) *testCluster {
 	t.Helper()
-	c := &testCluster{t: t, nodes: map[NodeID]*Node{}, applied: map[NodeID][]Entry{}}
+	c := &testCluster{t: t, nodes: map[NodeID]*Node{}, applied: map[NodeID][]Entry{},
+		loaded: map[NodeID][]Snapshot{}, down: map[NodeID]bool{}}
 	var peers []NodeID
 	for i := 1; i <= size; i++ {
 		peers = append(peers, NodeID(i))
@@ -56,13 +61,17 @@ func (c *testCluster) settle() {
 		for id, n := range c.nodes {
 			rd := n.Ready()
 			queue = append(queue, rd.Messages...)
+			if rd.Snapshot != nil {
+				c.loaded[id] = append(c.loaded[id], *rd.Snapshot)
+			}
 			c.applied[id] = append(c.applied[id], rd.Committed...)
 		}
 		if len(queue) == 0 {
 			return
 		}
+		c.sent = append(c.sent, queue...)
 		for _, m := range queue {
-			if dst := c.nodes[m.To]; dst != nil {
+			if dst := c.nodes[m.To]; dst != nil && !c.down[m.To] && !c.down[m.From] && (c.lose == nil || !c.lose(m)) {
 				if err := dst.Step(m); err != nil {
 					c.t.Fatalf("Step: %v", err)
 				}
@@ -255,7 +264,7 @@ func TestFollowerTruncatesConflictingSuffix(t *testing.T) {
 	if len(msgs) != 1 || msgs[0].Reject || msgs[0].LogIndex != 2 {
 		t.Fatalf("response = %+v, want accept with match index 2", msgs)
 	}
-	_, log, _ := st.Load()
+	_, _, log, _ := st.Load()
 	if len(log) != 2 || log[1].Term != 3 || string(log[1].Data) != "new" {
 		t.Fatalf("stored log = %+v, want index 2 replaced and index 3 gone", log)
 	}
@@ -325,7 +334,7 @@ func TestLeaderStepsDownOnHigherTerm(t *testing.T) {
 	if st := n.Status(); st.State != Follower || st.Term != 9 || st.Leader != None {
 		t.Fatalf("status = %+v, want leaderless follower in term 9", st)
 	}
-	if hard, _, _ := n.storage.Load(); hard.Term != 9 || hard.VotedFor != None {
+	if hard, _, _, _ := n.storage.Load(); hard.Term != 9 || hard.VotedFor != None {
 		t.Fatalf("stored hard state = %+v, want term 9 with no vote", hard)
 	}
 }
@@ -386,7 +395,7 @@ func TestLeaderBacksUpToRepairDivergedFollower(t *testing.T) {
 	}
 	c.settle()
 
-	_, got, _ := st.Load()
+	_, _, got, _ := st.Load()
 	if len(got) != len(leader.log) {
 		t.Fatalf("node 3 log has %d entries, leader has %d", len(got), len(leader.log))
 	}
@@ -452,5 +461,339 @@ func TestStorageFailureFailsClosed(t *testing.T) {
 	}
 	if _, _, err := n.Propose(nil); !errors.Is(err, boom) {
 		t.Fatalf("Propose after failure = %v, want the original error", err)
+	}
+}
+
+// proposeN proposes n entries on the leader and lets the cluster settle.
+func (c *testCluster) proposeN(leader *Node, n int) {
+	c.t.Helper()
+	for i := 0; i < n; i++ {
+		if _, _, err := leader.Propose([]byte{byte(i)}); err != nil {
+			c.t.Fatalf("Propose: %v", err)
+		}
+	}
+	c.settle()
+}
+
+func (c *testCluster) beat(leader *Node) {
+	c.t.Helper()
+	for i := 0; i < testBeat; i++ {
+		if err := leader.Tick(); err != nil {
+			c.t.Fatalf("Tick: %v", err)
+		}
+	}
+	c.settle()
+}
+
+func TestCompactDropsTheLogAndSurvivesRestart(t *testing.T) {
+	st := NewMemoryStorage()
+	n := newTestNode(t, 1, []NodeID{1}, st)
+	for n.state != Leader {
+		_ = n.Tick()
+	}
+	for i := 0; i < 9; i++ {
+		if _, _, err := n.Propose([]byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(n.Ready().Committed); got != 10 { // the no-op and nine proposals
+		t.Fatalf("applied %d entries, want 10", got)
+	}
+
+	if err := n.Compact(8, []byte("state@8"), 2); err != nil {
+		t.Fatal(err)
+	}
+	if st := n.Status(); st.SnapshotIndex != 8 || st.FirstIndex != 7 || st.LastIndex != 10 {
+		t.Fatalf("after compacting at 8 keeping 2: %+v", st)
+	}
+	_, snap, log, _ := st.Load()
+	if snap.Index != 8 || snap.Term != 1 || string(snap.Data) != "state@8" || len(log) != 4 || log[0].Index != 7 {
+		t.Fatalf("stored snapshot %+v with %d entries from %d", snap, len(log), log[0].Index)
+	}
+
+	// Compacting backwards, or past what was applied, is a caller's bug.
+	if err := n.Compact(8, nil, 0); err == nil {
+		t.Fatal("compacting at the snapshot's own index succeeded")
+	}
+	if err := n.Compact(11, nil, 0); err == nil {
+		t.Fatal("compacting past the applied index succeeded")
+	}
+
+	// A restart hands the snapshot back first, then only what follows it.
+	n2 := newTestNode(t, 1, []NodeID{1}, st)
+	rd := n2.Ready()
+	if rd.Snapshot == nil || rd.Snapshot.Index != 8 || string(rd.Snapshot.Data) != "state@8" {
+		t.Fatalf("restart handed out snapshot %+v", rd.Snapshot)
+	}
+	if len(rd.Committed) != 0 {
+		t.Fatalf("restart handed out %d entries before hearing from anyone", len(rd.Committed))
+	}
+	for n2.state != Leader {
+		_ = n2.Tick()
+	}
+	rd = n2.Ready()
+	if rd.Snapshot != nil {
+		t.Fatal("the snapshot was handed out twice")
+	}
+	if len(rd.Committed) != 3 || rd.Committed[0].Index != 9 || rd.Committed[2].Index != 11 {
+		t.Fatalf("after restart applied %+v, want indexes 9, 10 and the new leader's no-op at 11", rd.Committed)
+	}
+}
+
+func TestFollowerBehindCompactionIsSentTheSnapshot(t *testing.T) {
+	c := newTestCluster(t, 3)
+	leader := c.elect(1)
+	c.down[3] = true
+	c.proposeN(leader, 10) // indexes 2..11, committed by nodes 1 and 2
+
+	if err := leader.Compact(11, []byte("state@11"), 0); err != nil {
+		t.Fatal(err)
+	}
+	c.down[3] = false
+	c.proposeN(leader, 2) // indexes 12, 13
+	c.beat(leader)
+	c.beat(leader)
+
+	if got := c.loaded[3]; len(got) != 1 || got[0].Index != 11 || string(got[0].Data) != "state@11" {
+		t.Fatalf("node 3 loaded snapshots %+v, want the one at 11", got)
+	}
+	// It applied the one entry it saw before it went quiet, nothing else
+	// the snapshot covers, and everything after.
+	var got []uint64
+	for _, e := range c.applied[3] {
+		got = append(got, e.Index)
+	}
+	if len(got) != 3 || got[0] != 1 || got[1] != 12 || got[2] != 13 {
+		t.Fatalf("node 3 applied indexes %v, want [1 12 13]", got)
+	}
+	n3 := c.nodes[3]
+	if n3.commit != 13 || n3.lastIndex() != 13 || n3.snap.Index != 11 || len(n3.log) != 2 {
+		t.Fatalf("node 3: commit %d last %d snapshot %d log %d", n3.commit, n3.lastIndex(), n3.snap.Index, len(n3.log))
+	}
+	if leader.match[3] != 13 {
+		t.Fatalf("leader thinks node 3 holds up to %d, want 13", leader.match[3])
+	}
+}
+
+// Entries kept behind a snapshot are for exactly this: a follower only a
+// little behind is caught up from the log.
+func TestFollowerWithinKeptEntriesIsNotSentTheSnapshot(t *testing.T) {
+	c := newTestCluster(t, 3)
+	leader := c.elect(1)
+	c.proposeN(leader, 5) // 2..6 everywhere
+	c.down[3] = true
+	c.proposeN(leader, 3) // 7..9, node 3 misses them
+	if err := leader.Compact(9, []byte("state@9"), 4); err != nil {
+		t.Fatal(err)
+	}
+	c.down[3] = false
+	c.sent = nil
+	c.beat(leader)
+	c.beat(leader)
+
+	for _, m := range c.sent {
+		if m.Type == MsgSnapshot {
+			t.Fatal("leader sent a snapshot to a follower it could catch up from the log")
+		}
+	}
+	if len(c.loaded[3]) != 0 || c.nodes[3].lastIndex() != 9 || c.nodes[3].commit != 9 {
+		t.Fatalf("node 3: loaded %d snapshots, last %d, commit %d", len(c.loaded[3]), c.nodes[3].lastIndex(), c.nodes[3].commit)
+	}
+}
+
+func TestSnapshotOlderThanCommitIsNotInstalled(t *testing.T) {
+	st := NewMemoryStorage()
+	n := newTestNode(t, 2, []NodeID{1, 2, 3}, st)
+	var entries []Entry
+	for i := uint64(1); i <= 6; i++ {
+		entries = append(entries, Entry{Index: i, Term: 1, Data: []byte{byte(i)}})
+	}
+	mustStep(t, n, Message{Type: MsgAppend, From: 1, To: 2, Term: 1, Entries: entries, Commit: 6})
+	if got := len(n.Ready().Committed); got != 6 {
+		t.Fatalf("applied %d, want 6", got)
+	}
+
+	mustStep(t, n, Message{Type: MsgSnapshot, From: 1, To: 2, Term: 1, Snapshot: &Snapshot{Index: 4, Term: 1, Data: []byte("old")}})
+	rd := n.Ready()
+	if rd.Snapshot != nil {
+		t.Fatal("a snapshot behind the commit index was handed to the state machine")
+	}
+	if len(rd.Messages) != 1 || rd.Messages[0].Reject || rd.Messages[0].LogIndex != 6 {
+		t.Fatalf("response = %+v, want an acknowledgement at the commit index", rd.Messages)
+	}
+	if n.lastIndex() != 6 || n.commit != 6 || n.snap.Index != 0 {
+		t.Fatalf("node changed: last %d commit %d snapshot %d", n.lastIndex(), n.commit, n.snap.Index)
+	}
+}
+
+// A follower whose log already runs through the snapshot's last entry
+// keeps its log, entries after the snapshot included.
+func TestSnapshotThatMatchesTheLogOnlyAdvancesCommit(t *testing.T) {
+	n := newTestNode(t, 2, []NodeID{1, 2, 3}, NewMemoryStorage())
+	var entries []Entry
+	for i := uint64(1); i <= 6; i++ {
+		entries = append(entries, Entry{Index: i, Term: 1})
+	}
+	mustStep(t, n, Message{Type: MsgAppend, From: 1, To: 2, Term: 1, Entries: entries, Commit: 2})
+	n.Ready()
+
+	mustStep(t, n, Message{Type: MsgSnapshot, From: 1, To: 2, Term: 1, Snapshot: &Snapshot{Index: 4, Term: 1}})
+	rd := n.Ready()
+	if rd.Snapshot != nil {
+		t.Fatal("the state machine was reset although the log already held the snapshot's entries")
+	}
+	if len(rd.Committed) != 2 || rd.Committed[0].Index != 3 || rd.Committed[1].Index != 4 {
+		t.Fatalf("applied %+v, want indexes 3 and 4", rd.Committed)
+	}
+	if n.lastIndex() != 6 {
+		t.Fatalf("log now ends at %d, want 6: entries after the snapshot were dropped", n.lastIndex())
+	}
+}
+
+// A follower that disagrees with the snapshot at its last index holds
+// entries from a leader that lost. All of them go.
+func TestSnapshotReplacesAConflictingLog(t *testing.T) {
+	st := NewMemoryStorage()
+	n := newTestNode(t, 2, []NodeID{1, 2, 3}, st)
+	mustStep(t, n, Message{Type: MsgAppend, From: 1, To: 2, Term: 1, Entries: []Entry{
+		{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1}, {Index: 4, Term: 1},
+	}, Commit: 1})
+	n.Ready()
+
+	mustStep(t, n, Message{Type: MsgSnapshot, From: 3, To: 2, Term: 2, Snapshot: &Snapshot{Index: 3, Term: 2, Data: []byte("s")}})
+	rd := n.Ready()
+	if rd.Snapshot == nil || rd.Snapshot.Index != 3 {
+		t.Fatalf("snapshot handed out: %+v", rd.Snapshot)
+	}
+	if n.lastIndex() != 3 || len(n.log) != 0 || n.commit != 3 {
+		t.Fatalf("after install: last %d, %d log entries, commit %d", n.lastIndex(), len(n.log), n.commit)
+	}
+	_, snap, log, _ := st.Load()
+	if snap.Index != 3 || len(log) != 0 {
+		t.Fatalf("stored snapshot at %d with %d entries", snap.Index, len(log))
+	}
+	// The next append builds on the snapshot's last entry.
+	mustStep(t, n, Message{Type: MsgAppend, From: 3, To: 2, Term: 2, LogIndex: 3, LogTerm: 2,
+		Entries: []Entry{{Index: 4, Term: 2}}, Commit: 4})
+	if rd := n.Ready(); len(rd.Committed) != 1 || rd.Committed[0].Index != 4 || rd.Committed[0].Term != 2 {
+		t.Fatalf("applied %+v after the snapshot, want index 4 of term 2", rd.Committed)
+	}
+}
+
+// An append that starts inside what the snapshot covers is accepted from
+// the snapshot's edge on, not refused.
+func TestAppendOverlappingTheSnapshotIsAccepted(t *testing.T) {
+	n := newTestNode(t, 2, []NodeID{1, 2, 3}, NewMemoryStorage())
+	mustStep(t, n, Message{Type: MsgSnapshot, From: 1, To: 2, Term: 1, Snapshot: &Snapshot{Index: 5, Term: 1}})
+	n.Ready()
+
+	mustStep(t, n, Message{Type: MsgAppend, From: 1, To: 2, Term: 1, LogIndex: 3, LogTerm: 1, Entries: []Entry{
+		{Index: 4, Term: 1}, {Index: 5, Term: 1}, {Index: 6, Term: 1}, {Index: 7, Term: 1},
+	}, Commit: 7})
+	rd := n.Ready()
+	if len(rd.Messages) != 1 || rd.Messages[0].Reject || rd.Messages[0].LogIndex != 7 {
+		t.Fatalf("response = %+v, want accept with match index 7", rd.Messages)
+	}
+	if len(rd.Committed) != 2 || rd.Committed[0].Index != 6 {
+		t.Fatalf("applied %+v, want indexes 6 and 7", rd.Committed)
+	}
+
+	// One that lies wholly inside the snapshot is acknowledged at its edge.
+	mustStep(t, n, Message{Type: MsgAppend, From: 1, To: 2, Term: 1, LogIndex: 1, LogTerm: 1, Entries: []Entry{
+		{Index: 2, Term: 1}, {Index: 3, Term: 1},
+	}})
+	if msgs := n.Ready().Messages; len(msgs) != 1 || msgs[0].Reject || msgs[0].LogIndex != 5 {
+		t.Fatalf("response = %+v, want accept with match index 5", msgs)
+	}
+}
+
+// A snapshot can take much longer to arrive than a heartbeat. The leader
+// must not send it again on every heartbeat in between.
+func TestSnapshotIsNotResentWhileOneIsInFlight(t *testing.T) {
+	c := newTestCluster(t, 3)
+	leader := c.elect(1)
+	c.down[3] = true
+	c.proposeN(leader, 6)
+	if err := leader.Compact(7, []byte("s"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Node 3 is back and refuses every append, since it lacks the entry
+	// they build on, but the snapshot itself keeps getting lost.
+	c.down[3] = false
+	c.lose = func(m Message) bool { return m.Type == MsgSnapshot }
+	c.sent = nil
+	for i := 0; i < testElection-1; i++ {
+		_ = leader.Tick()
+		c.settle()
+	}
+	count := 0
+	for _, m := range c.sent {
+		if m.Type == MsgSnapshot && m.To == 3 {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("leader sent %d snapshots in less than one election timeout, want 1", count)
+	}
+	// And it does try again once the pause is over.
+	c.lose = nil
+	for i := 0; i < 2*testElection; i++ {
+		_ = leader.Tick()
+		c.settle()
+	}
+	if len(c.loaded[3]) != 1 || c.nodes[3].commit != leader.commit {
+		t.Fatalf("node 3 never caught up: loaded %d snapshots, commit %d, leader commit %d",
+			len(c.loaded[3]), c.nodes[3].commit, leader.commit)
+	}
+}
+
+// A leader that can reach nobody cannot commit anything, and the rest of
+// the cluster has probably elected someone else. It must stop saying it
+// leads, or everything that asks it "who leads?" is told the wrong thing
+// for as long as the partition lasts.
+func TestLeaderCutOffFromAMajorityStepsDown(t *testing.T) {
+	c := newTestCluster(t, 3)
+	leader := c.elect(1)
+	term := leader.term
+
+	// With one follower still answering it has a majority and stays.
+	c.down[3] = true
+	for i := 0; i < 3*testElection; i++ {
+		_ = leader.Tick()
+		c.settle()
+	}
+	if leader.state != Leader {
+		t.Fatalf("leader stepped down while a majority still answered it (now %v)", leader.state)
+	}
+
+	// With neither, it gives up within two election timeouts.
+	c.down[2] = true
+	for i := 0; i < 2*testElection && leader.state == Leader; i++ {
+		_ = leader.Tick()
+		c.settle()
+	}
+	if leader.state != Follower {
+		t.Fatalf("leader is still %v after two election timeouts without a majority", leader.state)
+	}
+	st := leader.Status()
+	if st.Leader != None || st.Term != term {
+		t.Fatalf("after stepping down: leader %d, term %d; want no known leader and term %d unchanged", st.Leader, st.Term, term)
+	}
+	if _, _, err := leader.Propose([]byte("x")); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("Propose after stepping down: %v, want ErrNotLeader", err)
+	}
+}
+
+// A cluster of one is its own majority.
+func TestSingleNodeLeaderNeverStepsDown(t *testing.T) {
+	n := newTestNode(t, 1, []NodeID{1}, NewMemoryStorage())
+	for i := 0; i < 10*testElection; i++ {
+		if err := n.Tick(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n.state != Leader || n.term != 1 {
+		t.Fatalf("single node is %v in term %d, want leader in term 1", n.state, n.term)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"crypto/rand"
 	"encoding/hex"
+	"sort"
 	"sync"
 	"time"
 )
@@ -30,6 +31,9 @@ type topic struct {
 	logRec  func(walRecord, bool) waiter
 	walID   uint32
 	initial []*Job // restored jobs, already justified by the log
+	// restore, when set, is the whole of the topic's state to start from:
+	// ready jobs, live leases and counters. See Queue.State.
+	restore *TopicState
 	// newID mints job and lease IDs. Random by default; a replicated queue
 	// replaces it so every replica mints the same IDs from the same log.
 	newID func() string
@@ -51,6 +55,7 @@ type topicConfig struct {
 	logRec     func(walRecord, bool) waiter
 	walID      uint32
 	initial    []*Job
+	restore    *TopicState
 	newID      func() string
 	passive    bool
 }
@@ -65,6 +70,7 @@ type request struct {
 	pending   *pendingReq
 	expireAll chan struct{}
 	stats     chan Stats
+	state     chan TopicState
 }
 
 // pendingReq asks whether a Dequeue made at time at would find work: a
@@ -157,6 +163,7 @@ func newTopic(cfg topicConfig) *topic {
 		logRec:     cfg.logRec,
 		walID:      cfg.walID,
 		initial:    cfg.initial,
+		restore:    cfg.restore,
 		newID:      cfg.newID,
 		passive:    cfg.passive,
 		reqs:       make(chan request),
@@ -192,6 +199,25 @@ func (t *topic) run() {
 	t.initial = nil
 	stats.Enqueued = len(ready)
 	heap.Init(deadline)
+	if st := t.restore; st != nil {
+		t.restore = nil
+		ready = make([]*Job, 0, len(st.Ready))
+		for _, job := range st.Ready {
+			ready = append(ready, cloneJob(job))
+		}
+		for _, l := range st.Leased {
+			fl := &inflight{job: cloneJob(l.Job), leaseID: l.LeaseID, deadline: l.Deadline}
+			leases[fl.leaseID] = fl
+			heap.Push(deadline, fl)
+		}
+		stats = Stats{
+			InFlight:    len(st.Leased),
+			Acked:       st.Stats.Acked,
+			DeadLetters: st.Stats.DeadLetters,
+			Dropped:     st.Stats.Dropped,
+			Enqueued:    st.Stats.Enqueued,
+		}
+	}
 
 	// expire returns leases whose deadline has passed to the ready list (or
 	// the DLQ). It runs before every read of queue state so that expiry is
@@ -375,17 +401,25 @@ func (t *topic) run() {
 				}
 				var inflightOut []*Job
 				if r.includeInflight {
-					m := len(*deadline)
+					// In expiry order, not heap order: a heap's layout
+					// depends on the history that built it, and a replica
+					// restored from a snapshot has a different history
+					// from one that replayed the log.
+					order := append([]*inflight(nil), *deadline...)
+					sort.Slice(order, func(i, j int) bool {
+						if !order[i].deadline.Equal(order[j].deadline) {
+							return order[i].deadline.Before(order[j].deadline)
+						}
+						return order[i].leaseID < order[j].leaseID
+					})
+					m := len(order)
 					if limit > 0 && m > limit {
 						m = limit
 						truncated = true
 					}
 					inflightOut = make([]*Job, m)
 					for i := 0; i < m; i++ {
-						job := (*deadline)[i].job
-						copied := *job
-						copied.Payload = append([]byte(nil), job.Payload...)
-						inflightOut[i] = &copied
+						inflightOut[i] = cloneJob(order[i].job)
 					}
 				}
 				r.reply <- peekResp{ready: readyOut, inflight: inflightOut, truncated: truncated}
@@ -417,6 +451,30 @@ func (t *topic) run() {
 				snapshot := stats
 				snapshot.Ready = len(ready)
 				req.stats <- snapshot
+
+			case req.state != nil:
+				// Like Pending, this observes nothing: a lease past its
+				// deadline is reported as a lease.
+				st := TopicState{Name: t.name, Stats: stats}
+				st.Stats.Ready = len(ready)
+				st.Ready = make([]*Job, len(ready))
+				for i, job := range ready {
+					st.Ready[i] = cloneJob(job)
+				}
+				st.Leased = make([]LeasedJob, 0, deadline.Len())
+				for _, fl := range *deadline {
+					st.Leased = append(st.Leased, LeasedJob{Job: cloneJob(fl.job), LeaseID: fl.leaseID, Deadline: fl.deadline})
+				}
+				// The heap's layout depends on the order leases came and
+				// went. Its sort order does not.
+				sort.Slice(st.Leased, func(i, j int) bool {
+					a, b := st.Leased[i], st.Leased[j]
+					if !a.Deadline.Equal(b.Deadline) {
+						return a.Deadline.Before(b.Deadline)
+					}
+					return a.LeaseID < b.LeaseID
+				})
+				req.state <- st
 			}
 		}
 	}
@@ -526,6 +584,21 @@ func (t *topic) expireAll() {
 		return
 	}
 	<-done
+}
+
+// state copies out everything the topic holds; see Queue.State.
+func (t *topic) state() (TopicState, bool) {
+	reply := make(chan TopicState, 1)
+	if err := t.send(request{state: reply}); err != nil {
+		return TopicState{}, false
+	}
+	return <-reply, true
+}
+
+func cloneJob(job *Job) *Job {
+	c := *job
+	c.Payload = append([]byte(nil), job.Payload...)
+	return &c
 }
 
 func (t *topic) stats() Stats {

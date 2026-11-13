@@ -130,13 +130,15 @@ func runCluster(ctx context.Context, c config, logger *log.Logger) error {
 	transport := cluster.NewHTTPTransport(cc.id, cc.peers)
 	defer transport.Close()
 	node, err := cluster.Start(cluster.Config{
-		ID:         cc.id,
-		Peers:      cc.ids,
-		Storage:    rlog,
-		Transport:  transport,
-		Tick:       c.tick,
-		ClientAddr: func(id raft.NodeID) string { return cc.advertise[id] },
-		Logger:     logger,
+		ID:            cc.id,
+		Peers:         cc.ids,
+		Storage:       rlog,
+		Transport:     transport,
+		Tick:          c.tick,
+		SnapshotEvery: c.snapEvery,
+		SnapshotKeep:  c.snapKeep,
+		ClientAddr:    func(id raft.NodeID) string { return cc.advertise[id] },
+		Logger:        logger,
 	})
 	if err != nil {
 		return err
@@ -150,6 +152,7 @@ func runCluster(ctx context.Context, c config, logger *log.Logger) error {
 		jobqhttp.WithMaxPayload(c.maxPayload),
 		jobqhttp.WithMaxWait(c.maxWait),
 		jobqhttp.WithLogger(logger),
+		jobqhttp.WithDiskUsage(rlog.DiskUsage),
 	)
 	errc := make(chan error, 2)
 	go func() { errc <- serve(ctx, peerLn, cluster.PeerHandler(node), c.shutdownTimeout, logger) }()

@@ -34,7 +34,7 @@ func TestRaftLogSurvivesReopen(t *testing.T) {
 	if rep.Entries != 0 || rep.Term != 0 {
 		t.Fatalf("fresh log reported %+v", rep)
 	}
-	if _, _, err := l.Load(); err != nil {
+	if _, _, _, err := l.Load(); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.SaveHardState(raft.HardState{Term: 3, VotedFor: 2}); err != nil {
@@ -56,7 +56,7 @@ func TestRaftLogSurvivesReopen(t *testing.T) {
 
 	l, rep = mustOpenRaftLog(t, dir)
 	defer l.Close()
-	hard, entries, err := l.Load()
+	hard, _, entries, err := l.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestRaftLogTruncateIsReplayed(t *testing.T) {
 
 	for pass := 0; pass < 2; pass++ {
 		l, _ = mustOpenRaftLog(t, dir)
-		_, entries, err := l.Load()
+		_, _, entries, err := l.Load()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -176,7 +176,7 @@ func TestRaftLogTornTailIsDropped(t *testing.T) {
 	if !rep.TornTail || rep.BytesTruncated == 0 {
 		t.Errorf("report did not record the torn tail: %+v", rep)
 	}
-	hard, entries, err := l.Load()
+	hard, _, entries, err := l.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,10 +228,10 @@ func TestRaftLogAndQueueRefuseEachOthersDirectories(t *testing.T) {
 func TestRaftLogLoadOnlyOnce(t *testing.T) {
 	l, _ := mustOpenRaftLog(t, t.TempDir())
 	defer l.Close()
-	if _, _, err := l.Load(); err != nil {
+	if _, _, _, err := l.Load(); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := l.Load(); err == nil {
+	if _, _, _, err := l.Load(); err == nil {
 		t.Error("second Load succeeded; it would have returned an empty log")
 	}
 }
