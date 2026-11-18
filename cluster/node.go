@@ -248,6 +248,9 @@ func (n *Node) run() {
 			w.reply <- result{err: err}
 		}
 	}()
+	// silent is how many ticks have passed since any other node was last
+	// heard from. See cutOffAfter.
+	silent := 0
 
 	for {
 		var err error
@@ -256,8 +259,10 @@ func (n *Node) run() {
 			return
 		case <-ticker.C:
 			err = n.rn.Tick()
+			silent++
 		case m := <-n.inbox:
 			err = n.rn.Step(m)
+			silent = 0
 		case p := <-n.proposals:
 			err = n.propose(p, waiters)
 		}
@@ -265,6 +270,7 @@ func (n *Node) run() {
 			select {
 			case m := <-n.inbox:
 				err = n.rn.Step(m)
+				silent = 0
 			case p := <-n.proposals:
 				err = n.propose(p, waiters)
 			default:
@@ -321,6 +327,25 @@ func (n *Node) run() {
 			}
 			w.reply <- res
 		}
+		if silent >= n.cutOffAfter() && len(waiters) > 0 && n.rn.Status().State != raft.Leader {
+			// This node led, and has now heard from nobody for long
+			// enough that it is cut off, not merely waiting on slow
+			// followers. The callers still parked here are waiting on
+			// entries it can no longer see through: another leader may
+			// commit one that reached it before the cut, or discard it,
+			// and this node will not hear which until the network is
+			// whole. Left alone they would sit out the full timeout while
+			// the rest of the cluster carries on under a new leader. So
+			// they are told now what the timeout would have told them:
+			// the outcome is unknown. Not "not leader": that is a promise
+			// the entry did not happen, and it may have.
+			n.cfg.Logger.Printf("cluster: node %d has heard from no other node for %d ticks; telling %d waiting callers the outcome is unknown",
+				n.cfg.ID, silent, len(waiters))
+			for index, w := range waiters {
+				delete(waiters, index)
+				w.reply <- result{err: jobq.ErrUnavailable}
+			}
+		}
 
 		st := n.rn.Status()
 		if every := n.cfg.SnapshotEvery; every > 0 {
@@ -335,6 +360,24 @@ func (n *Node) run() {
 		n.publish(st)
 	}
 }
+
+// cutOffAfter is how many ticks of hearing from no other node it takes
+// before this node gives up on the callers parked on it: three full
+// election timeouts.
+//
+// Silence alone is not being cut off. Followers that are slow for a moment
+// say nothing either, the leader steps down within two election timeouts,
+// and then nobody speaks until some node's own election timeout runs out
+// and it stands. That is up to two full timeouts of silence in a cluster
+// with nothing wrong with it, after which the next leader commits what was
+// waiting and the callers get a real answer. Giving up inside that window
+// would turn a blip into errors. The third timeout is the margin.
+//
+// By the time it passes, a node that led has long since stepped down, so
+// this never fires on a leader; and a node that hears from anyone at all
+// starts counting again, because whoever it hears from can tell it what
+// became of its entries.
+func (n *Node) cutOffAfter() int { return 3 * 2 * n.cfg.ElectionTicks }
 
 // checkSnapshot is asked by the raft node before it installs a snapshot a
 // leader sent. The peer port takes bytes from the network, and installing

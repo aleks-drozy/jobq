@@ -722,6 +722,157 @@ func TestCutOffLeaderCannotHandOutJobs(t *testing.T) {
 // A whole-cluster restart rebuilds every queue from the log: acked jobs
 // stay gone, waiting jobs are still waiting, and leased jobs are waiting
 // again.
+// A leader cut off from the others cannot commit what its callers are
+// waiting on. Once it has heard from nobody for three election timeouts it
+// must tell them so, not leave them for the proposal timeout: the rest of
+// the cluster has had a new leader since the first of those timeouts, and
+// a caller parked here cannot go and find it.
+func TestCutOffLeaderGivesUpOnWaitingCallersLongBeforeTheTimeout(t *testing.T) {
+	c := newTestCluster(t, 3)
+	// Far longer than the test: an answer inside it is not the timeout's.
+	c.timeout = 5 * time.Minute
+	c.startAll()
+	mustEnqueue(t, c, "work", "before the cut")
+	c.converged()
+
+	old := c.leader()
+	var rest []raft.NodeID
+	for _, nid := range c.ids {
+		if nid != old.cfg.ID {
+			rest = append(rest, nid)
+		}
+	}
+	c.net.isolate(old.cfg.ID, c.ids)
+	if st := old.Status(); st.State != raft.Leader {
+		t.Fatalf("isolated node is %v, expected it to still believe it leads", st.State)
+	}
+
+	// Three callers, as a worker pool would have: an enqueue, a dequeue and
+	// an ack's worth of proposals all parked on the cut-off leader.
+	type answer struct {
+		op  string
+		err error
+	}
+	answers := make(chan answer, 3)
+	start := time.Now()
+	go func() {
+		_, err := old.Enqueue("work", []byte("during the cut"))
+		answers <- answer{"enqueue", err}
+	}()
+	go func() {
+		_, _, err := old.Dequeue("work", time.Hour)
+		answers <- answer{"dequeue", err}
+	}()
+	go func() {
+		_, err := old.Enqueue("other", []byte("during the cut"))
+		answers <- answer{"second enqueue", err}
+	}()
+	for i := 0; i < 3; i++ {
+		select {
+		case a := <-answers:
+			// The entry is in this node's log and nobody else's. Whether a
+			// later leader ends up with it cannot be known from here, so
+			// the only honest answer is that the outcome is unknown.
+			if !errors.Is(a.err, jobq.ErrUnavailable) {
+				t.Fatalf("%s on the cut-off leader returned %v, want ErrUnavailable", a.op, a.err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("a caller was still waiting on the cut-off leader after 10s (%d of 3 answered): "+
+				"it is left for the proposal timeout", i)
+		}
+	}
+	t.Logf("all three callers answered %s after the cut", time.Since(start).Round(time.Millisecond))
+	if st := old.Status(); st.State == raft.Leader {
+		t.Fatalf("callers were answered but the node still believes it leads: %+v", st)
+	}
+
+	// A call that arrives now is refused outright, as a definite no, so
+	// the client goes elsewhere.
+	var nl *jobq.NotLeaderError
+	if _, err := old.Enqueue("work", []byte("after it stepped down")); !errors.As(err, &nl) {
+		t.Fatalf("enqueue after stepping down returned %v, want a not-leader error", err)
+	}
+
+	// The rest of the cluster carried on without it, and it rejoins
+	// holding exactly what they hold. What it told its callers was unknown
+	// turned out, this time, not to have happened: nothing reached anyone.
+	lead := c.leaderAmong(rest...)
+	if _, err := lead.Enqueue("work", []byte("on the new leader")); err != nil {
+		t.Fatalf("the new leader could not enqueue: %v", err)
+	}
+	c.net.heal()
+	c.converged()
+	want := snapshot(lead)
+	for _, n := range c.live() {
+		if got := snapshot(n); got != want {
+			t.Fatalf("node %d diverged after the partition healed:\n%s\nwant:\n%s", n.cfg.ID, got, want)
+		}
+	}
+	if st := old.Stats("work"); st.Enqueued != 2 {
+		t.Fatalf("old leader holds %d enqueues on work after healing, want 2 (before the cut, and on the new leader)", st.Enqueued)
+	}
+	if st := old.Stats("other"); st.Enqueued != 0 {
+		t.Fatalf("old leader holds %d enqueues on other after healing, want 0", st.Enqueued)
+	}
+}
+
+// The other side of the rule above. A leader can stop hearing its followers
+// for a moment without being cut off: they are slow, or their replies are
+// lost. It steps down all the same, and a moment later the cluster has a
+// leader again and commits what was waiting. A caller parked through that
+// must get its answer. Telling it the outcome is unknown the instant the
+// node steps down, which is the obvious way to make the test above pass,
+// fails this one.
+func TestLeaderThatBrieflyLosesItsFollowersKeepsItsCallers(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.timeout = 5 * time.Minute
+	c.startAll()
+	mustEnqueue(t, c, "work", "before")
+	c.converged()
+
+	old := c.leader()
+	// Replies to the leader are lost; what it sends still arrives. So the
+	// followers hold the entry below and go on hearing heartbeats, while
+	// the leader hears nobody.
+	c.net.mu.Lock()
+	for _, p := range c.ids {
+		if p != old.cfg.ID {
+			c.net.cut[[2]raft.NodeID{p, old.cfg.ID}] = true
+		}
+	}
+	c.net.mu.Unlock()
+
+	type answer struct {
+		id  string
+		err error
+	}
+	parked := make(chan answer, 1)
+	go func() {
+		id, err := old.Enqueue("work", []byte("parked"))
+		parked <- answer{id, err}
+	}()
+
+	// It gives up leading, having heard from no majority...
+	eventually(t, "the leader to step down", func() bool { return old.Status().State != raft.Leader })
+	// ...and at that moment the replies start arriving again.
+	c.net.heal()
+
+	select {
+	case a := <-parked:
+		if a.err != nil {
+			t.Fatalf("the parked enqueue returned %v; every node held the entry, and the next leader committed it", a.err)
+		}
+		c.converged()
+		for _, n := range c.live() {
+			if st := n.Stats("work"); st.Enqueued != 2 {
+				t.Fatalf("node %d holds %d enqueues, want 2 (before, and the parked one): %+v", n.cfg.ID, st.Enqueued, st)
+			}
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the parked enqueue was never answered")
+	}
+}
+
 func TestWholeClusterRestartRebuildsFromTheLog(t *testing.T) {
 	c := newTestCluster(t, 3).startAll()
 	for i := 0; i < 6; i++ {

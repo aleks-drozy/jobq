@@ -323,9 +323,20 @@ these show the shape and not what a real network would give:
 |---|---|---|---|
 | Leader killed | 406 / 1,731 | 349 / 1,586 | one election, about 250 ms; one run in ten took seven terms |
 | Follower killed | no interruption | 36 / 112 | a majority is still there |
-| Leader cut off, clients still reach it | 3,397 / 3,832 | 3,316 / 3,786 | a new leader in 376 ms, but calls in flight on the old one wait out its 5 s timeout or the partition, whichever ends first |
+| Leader cut off, clients still reach it | 954 / 1,334 | 908 / 1,306 | a new leader in about 380 ms; calls in flight on the old one are told "outcome unknown" once it has heard from no other node for three election timeouts (900 ms) |
 | Follower cut off | no interruption | 401 / 742 | the stall is on its return: with no pre-vote it comes back terms ahead and unseats the leader, ten times out of ten |
 | 100 ms, 5% loss on every link | 3,635 / 4,246 | 3,342 / 3,984 | the default 10 ms tick cannot hold a leader on that link; with `-tick 50ms` it does, at 397 ms a write |
+
+The cut-off leader was the one row the matrix showed to be wrong. Calls
+in flight on it used to wait for the 5 s proposal timeout or for the
+partition to heal, whichever came first: 3,316 ms at this hold, 5,022 ms
+with the partition held longer, while the rest of the cluster had a leader
+after 376 ms. That row is from after the fix; the others are the original
+runs. The cost is in what those callers are told. A call caught on the
+cut-off leader now fails as "outcome unknown" after 0.9 s where, in a
+partition shorter than 5 s, it used to wait and get a definite answer.
+That was three calls per partition here, about a third of which turned
+out to have gone through.
 
 **What snapshots buy**, measured once on that laptop with 500,000 jobs
 through one durable node, 50,000 of them still queued at the end:
@@ -340,10 +351,10 @@ and what they cost: taking that snapshot stopped the node for 99 ms.
 
 **What this does not do yet.** It has run only on one machine, never
 across several, and the Docker and AWS files have never been run at all.
-A leader cut off from the others keeps its waiting callers for up to five
-seconds before telling them it cannot answer, and a node returning from a
-partition forces an election; both are measured above and neither is
-fixed. A
+A node returning from a partition forces an election, measured above and
+not fixed. A call caught on a leader as it is cut off comes back as
+"outcome unknown", and the client does not retry it on another node,
+though for an enqueue the request ID would make that safe. A
 snapshot stops the node that takes it until it is on disk, and is sent to
 a follower as one message, so this design does not suit a queue holding
 gigabytes. Membership is fixed: replacing a dead node is a manual

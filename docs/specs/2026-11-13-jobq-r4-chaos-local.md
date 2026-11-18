@@ -164,7 +164,8 @@ None of these breaks the contract. All four are about how long clients
 wait, and the first is not what the design intends.
 
 **1. A leader that is cut off stalls its clients for five seconds, not for
-one election.** With the leader cut off from the other nodes but still
+one election.** (Fixed 2026-11-18; see the end of this document. What
+follows is what was found.) With the leader cut off from the other nodes but still
 reachable by clients, another node led within 376 ms (median). Clients
 did not get a write through until the partition was healed, 3.3 s later.
 Held for 8 s instead, the stall was 5.02 s in five runs out of five.
@@ -255,6 +256,81 @@ that version, on a machine with one user.
 
 Against a cluster that already exists, `jobqchaos -nodes ... -hook ...`
 with a hook that implements the six verbs for it.
+
+## 2026-11-18: finding 1 fixed
+
+A node now gives up on the callers parked on it once it has heard from no
+other node for three full election timeouts (900 ms at the default tick),
+and tells them what the proposal timeout would have: unavailable, outcome
+unknown. `cluster/node.go`, `cutOffAfter`. Nothing in `raft/` changed.
+
+**The obvious fix was wrong, and the test suite said so.** The first
+version answered the waiting callers the moment the leader stepped down
+for want of a majority. It passed its own test, with the cut-off leader's
+callers answered in 96 ms at the test's tick. It also failed
+`TestWholeClusterRestoredFromOneNodesDisk`, once, under the load of the
+full gate, with a call on a healthy cluster coming back "outcome unknown".
+
+A leader can go a whole election timeout without hearing its followers
+when nothing is cut: they are slow, their disks are slow, the machine is
+busy. It steps down, some node stands when its own timeout runs out, and
+the new leader's first entry commits everything that was waiting. Before
+any fix a caller parked through that got its real answer a fraction of a
+second later. Answering at the step-down turned every such blip into an
+error. `TestLeaderThatBrieflyLosesItsFollowersKeepsItsCallers` is that
+case made deterministic: replies to the leader are dropped until it steps
+down, then let through, and the parked enqueue must succeed. It fails
+against the first version every time.
+
+**So the rule is silence, and three timeouts of it.** Stepping down is not
+evidence of being cut off; hearing from nobody for long enough is. In a
+healthy cluster the silence is bounded. The leader steps down within one
+full timeout of last hearing anyone, and until then the followers are
+still hearing it, so none of them stands. After that it is up to one more
+full timeout before some node's own timer runs out and it asks for votes.
+That is two full timeouts in which a cluster with nothing wrong may send
+the old leader nothing. The third is margin. Any message from any node
+starts the count again, since whoever sent it can say what became of the
+entries.
+
+**Measured, same lab and settings as above:**
+
+| Leader cut off | Hold | Runs | Longest stall, median / worst (ms) | First write after the fault (ms) |
+|---|---|---|---|---|
+| before | 3 s | 10 | 3,316 / 3,786 | 3,397 / 3,832 |
+| after | 3 s | 10 | 908 / 1,306 | 954 / 1,334 |
+| before | 8 s | 5 | 5,022 / 5,027 | 5,046 / 5,053 |
+| after | 8 s | 5 | 943 / 1,283 | 962 / 1,329 |
+
+The stall no longer depends on how long the partition lasts. It is the
+three timeouts: the election, 383 ms at the median, finishes inside them.
+The worst runs are the two where the election outlasted them (1,051 and
+1,142 ms to a new leader).
+
+The whole matrix was then run again, ten runs per fault. With the two
+passes above that is 65 more faults: 26,382 acknowledged enqueues, 0 lost,
+0 ghosts, 146 duplicates. The other four faults did not move beyond the
+run-to-run spread, and no enqueue call failed under any of them, the slow
+network included: the rule did not fire where no node was cut off. Raw
+runs are in `docs/results/2026-11-18-cut-off-leader-fix/`.
+
+**What it costs.** The callers caught on the cut-off leader are now told
+"outcome unknown" at 0.9 s. With a partition longer than 5 s that is what
+they were always told, later. With a shorter one they used to wait it out
+and get a definite answer, and now they do not: at a 3 s hold, 0 enqueue
+calls failed before the fix and 30 after, three per partition, one per
+producer. Of the 60 such calls across the 3 s runs after the fix, 21 had
+in fact gone through: they reached a follower before the cut and the next
+leader committed them. So "unknown" is still the honest answer. Nothing
+acknowledged was lost and nothing was added twice.
+
+**Not done.** The client does not retry an unavailable enqueue on another
+node. Request IDs make that safe, and it would turn those failures into
+successes; it is a change to what the client promises and was left as a
+decision. The first version would have cut the stall to roughly the
+length of the election, about 0.4 s; that was not measured in the lab.
+The half second between the two is the price of not failing callers on a
+healthy cluster.
 
 ## What this does not show
 
