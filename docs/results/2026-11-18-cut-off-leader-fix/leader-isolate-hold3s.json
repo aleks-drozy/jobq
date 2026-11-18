@@ -1,0 +1,263 @@
+{
+  "started": "2026-11-18T16:51:09.808845554Z",
+  "finished": "2026-11-18T16:52:10.837770537Z",
+  "seed": 1795020669808717981,
+  "nodes": 3,
+  "runs_per_fault": 10,
+  "hold_ms": 3000,
+  "settle_ms": 2000,
+  "producers": 3,
+  "consumers": 4,
+  "pace_ms": 5,
+  "faults": [
+    {
+      "fault": "leader-isolate",
+      "what": "leader cut off from the other nodes, still reachable by clients",
+      "topic": "chaos-leader-isolate",
+      "runs": [
+        {
+          "run": 1,
+          "targets": [
+            2
+          ],
+          "leader_before": 2,
+          "leader_after": 3,
+          "term_before": 1,
+          "term_after": 14,
+          "inject_ms": 45.14,
+          "first_write_ms": 955.413,
+          "new_leader_ms": 219.396,
+          "longest_stall_ms": 919.105,
+          "whole_again_ms": 403.986,
+          "writes_ok": 319,
+          "writes_failed": 0,
+          "baseline_p50_ms": 17.079,
+          "baseline_p99_ms": 26.065,
+          "fault_p50_ms": 13.928,
+          "fault_p99_ms": 21.024,
+          "seen": true,
+          "evidence": "node 3 led term 2; cut-off node 2 was candidate in term 12"
+        },
+        {
+          "run": 2,
+          "targets": [
+            3
+          ],
+          "leader_before": 3,
+          "leader_after": 2,
+          "term_before": 14,
+          "term_after": 27,
+          "inject_ms": 47.124,
+          "first_write_ms": 945.757,
+          "new_leader_ms": 386.461,
+          "longest_stall_ms": 901.002,
+          "whole_again_ms": 342.338,
+          "writes_ok": 322,
+          "writes_failed": 1,
+          "baseline_p50_ms": 19.765,
+          "baseline_p99_ms": 26.113,
+          "fault_p50_ms": 14.024,
+          "fault_p99_ms": 20.757,
+          "seen": true,
+          "evidence": "node 1 led term 16; cut-off node 3 was candidate in term 25"
+        },
+        {
+          "run": 3,
+          "targets": [
+            2
+          ],
+          "leader_before": 2,
+          "leader_after": 1,
+          "term_before": 27,
+          "term_after": 41,
+          "inject_ms": 50.886,
+          "first_write_ms": 961.252,
+          "new_leader_ms": 546.051,
+          "longest_stall_ms": 921.277,
+          "whole_again_ms": 368.925,
+          "writes_ok": 285,
+          "writes_failed": 0,
+          "baseline_p50_ms": 19.683,
+          "baseline_p99_ms": 37.993,
+          "fault_p50_ms": 15.622,
+          "fault_p99_ms": 25.498,
+          "seen": true,
+          "evidence": "node 3 led term 30; cut-off node 2 was candidate in term 39"
+        },
+        {
+          "run": 4,
+          "targets": [
+            1
+          ],
+          "leader_before": 1,
+          "leader_after": 3,
+          "term_before": 41,
+          "term_after": 55,
+          "inject_ms": 45.464,
+          "first_write_ms": 945.947,
+          "new_leader_ms": 209.007,
+          "longest_stall_ms": 903.214,
+          "whole_again_ms": 558.281,
+          "writes_ok": 283,
+          "writes_failed": 1,
+          "baseline_p50_ms": 19.618,
+          "baseline_p99_ms": 23.609,
+          "fault_p50_ms": 16.291,
+          "fault_p99_ms": 49.544,
+          "seen": true,
+          "evidence": "node 2 led term 42; cut-off node 1 was candidate in term 52"
+        },
+        {
+          "run": 5,
+          "targets": [
+            3
+          ],
+          "leader_before": 3,
+          "leader_after": 1,
+          "term_before": 55,
+          "term_after": 70,
+          "inject_ms": 50.765,
+          "first_write_ms": 1333.652,
+          "new_leader_ms": 1050.553,
+          "longest_stall_ms": 1305.868,
+          "whole_again_ms": 493.971,
+          "writes_ok": 222,
+          "writes_failed": 0,
+          "baseline_p50_ms": 19.178,
+          "baseline_p99_ms": 24.784,
+          "fault_p50_ms": 17.751,
+          "fault_p99_ms": 387.549,
+          "seen": true,
+          "evidence": "node 2 led term 61; cut-off node 3 was candidate in term 67"
+        },
+        {
+          "run": 6,
+          "targets": [
+            1
+          ],
+          "leader_before": 1,
+          "leader_after": 2,
+          "term_before": 70,
+          "term_after": 85,
+          "inject_ms": 46.838,
+          "first_write_ms": 952.574,
+          "new_leader_ms": 454.493,
+          "longest_stall_ms": 908.293,
+          "whole_again_ms": 705.948,
+          "writes_ok": 288,
+          "writes_failed": 3,
+          "baseline_p50_ms": 18.98,
+          "baseline_p99_ms": 24.937,
+          "fault_p50_ms": 16.707,
+          "fault_p99_ms": 23.336,
+          "seen": true,
+          "evidence": "node 3 led term 72; cut-off node 1 was candidate in term 81"
+        },
+        {
+          "run": 7,
+          "targets": [
+            2
+          ],
+          "leader_before": 2,
+          "leader_after": 3,
+          "term_before": 85,
+          "term_after": 100,
+          "inject_ms": 45.132,
+          "first_write_ms": 953.526,
+          "new_leader_ms": 252.97,
+          "longest_stall_ms": 906.035,
+          "whole_again_ms": 536.431,
+          "writes_ok": 295,
+          "writes_failed": 3,
+          "baseline_p50_ms": 18.062,
+          "baseline_p99_ms": 26.878,
+          "fault_p50_ms": 15.851,
+          "fault_p99_ms": 24.284,
+          "seen": true,
+          "evidence": "node 3 led term 86; cut-off node 2 was candidate in term 98"
+        },
+        {
+          "run": 8,
+          "targets": [
+            3
+          ],
+          "leader_before": 3,
+          "leader_after": 1,
+          "term_before": 100,
+          "term_after": 115,
+          "inject_ms": 47.244,
+          "first_write_ms": 951.254,
+          "new_leader_ms": 382.858,
+          "longest_stall_ms": 902.846,
+          "whole_again_ms": 582.542,
+          "writes_ok": 305,
+          "writes_failed": 2,
+          "baseline_p50_ms": 17.97,
+          "baseline_p99_ms": 24.558,
+          "fault_p50_ms": 14.725,
+          "fault_p99_ms": 21.914,
+          "seen": true,
+          "evidence": "node 2 led term 102; cut-off node 3 was candidate in term 112"
+        },
+        {
+          "run": 9,
+          "targets": [
+            1
+          ],
+          "leader_before": 1,
+          "leader_after": 3,
+          "term_before": 115,
+          "term_after": 129,
+          "inject_ms": 45.804,
+          "first_write_ms": 960.726,
+          "new_leader_ms": 204.986,
+          "longest_stall_ms": 922.203,
+          "whole_again_ms": 429.4,
+          "writes_ok": 299,
+          "writes_failed": 0,
+          "baseline_p50_ms": 17.948,
+          "baseline_p99_ms": 27.036,
+          "fault_p50_ms": 15.359,
+          "fault_p99_ms": 23.09,
+          "seen": true,
+          "evidence": "node 3 led term 116; cut-off node 1 was candidate in term 127"
+        },
+        {
+          "run": 10,
+          "targets": [
+            3
+          ],
+          "leader_before": 3,
+          "leader_after": 2,
+          "term_before": 129,
+          "term_after": 143,
+          "inject_ms": 44.782,
+          "first_write_ms": 982.07,
+          "new_leader_ms": 964.378,
+          "longest_stall_ms": 935.939,
+          "whole_again_ms": 495.796,
+          "writes_ok": 304,
+          "writes_failed": 2,
+          "baseline_p50_ms": 17.028,
+          "baseline_p99_ms": 25.279,
+          "fault_p50_ms": 14.635,
+          "fault_p99_ms": 24.563,
+          "seen": true,
+          "evidence": "node 2 led term 134; cut-off node 3 was candidate in term 140"
+        }
+      ],
+      "contract": {
+        "acknowledged_enqueues": 5916,
+        "lost": 0,
+        "ghosts": 0,
+        "duplicates": 41,
+        "completed": 5913,
+        "unconfirmed_acks": 10,
+        "failed_enqueues": 30,
+        "dead_lettered": 0,
+        "node_enqueued": 5923,
+        "violations": []
+      }
+    }
+  ]
+}

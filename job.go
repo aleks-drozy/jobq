@@ -38,9 +38,10 @@ var (
 	// error may be a *NotLeaderError carrying the leader's address.
 	ErrNotLeader = errors.New("jobq: not the leader")
 	// ErrUnavailable means a replicated node accepted the operation but
-	// could not confirm, in time, that a majority committed it. The
-	// outcome is unknown: it may still be applied. A single-node queue
-	// never returns it.
+	// could not confirm that a majority committed it: it waited as long
+	// as it is willing to, or it was cut off from every other node while
+	// waiting. The outcome is unknown: it may still be applied. A
+	// single-node queue never returns it.
 	ErrUnavailable = errors.New("jobq: outcome unknown, cluster did not confirm in time")
 )
 
